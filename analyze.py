@@ -192,8 +192,10 @@ def generate_content_ideas(client: OpenAI, top_tweets: list[dict], analyses: lis
 # Discord
 # ─────────────────────────────────────────────
 
-def _fmt_num(n: int | float) -> str:
+def _fmt_num(n: int | float | None) -> str:
     """Format large numbers compactly: 4200 → 4.2K"""
+    if n is None:
+        return "0"
     n = int(n)
     if n >= 1_000_000:
         return f"{n/1_000_000:.1f}M"
