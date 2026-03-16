@@ -1,0 +1,17 @@
+{
+  "x_monitor_window_path": "/Users/giga/projects/openclaw/x-monitor/tweets_window.json",
+  "discord_channel_id": "1477727527618347340",
+  "openai_model": "gpt-4o-mini",
+  "top_n": 10,
+  "top_deep_dive": 3,
+  "trigger_interval_hours": 4,
+  "pending_actions_path": "pending_actions.json",
+  "score_weights": {
+    "likes": 3,
+    "retweets": 5,
+    "replies": 2,
+    "views": 0.01,
+    "quotes": 4,
+    "bookmarks": 2
+  }
+}

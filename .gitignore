@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.uv/
+.venv/
+dist/
+*.egg-info/
+pending_actions.json
