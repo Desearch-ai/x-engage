@@ -396,7 +396,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     else:
         tweets = json.loads(window_path.read_text())
 
-    print(f"[analyze] Loaded {len(tweets)} tweets from window")
+    print(f"[analyze] Loaded {len(tweets)} tweets from window", file=sys.stderr)
 
     weights = cfg.get("score_weights", {
         "likes": 3, "retweets": 5, "replies": 2,
@@ -408,7 +408,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
 
     # Score & rank
     top_10 = get_top_tweets(tweets, weights, top_n)
-    print(f"[analyze] Top {len(top_10)} tweets selected")
+    print(f"[analyze] Top {len(top_10)} tweets selected", file=sys.stderr)
 
     # LLM analysis (only top-3, not all 10 — cost-efficient)
     openai_key = os.environ.get("OPENAI_API_KEY", "")
@@ -421,12 +421,12 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     analyses = []
     for i, tweet in enumerate(top_for_deep, 1):
         uname = _username(tweet)
-        print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score',0):.1f})")
+        print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score',0):.1f})", file=sys.stderr)
         analysis = analyse_tweet_with_llm(client, tweet, model)
         analyses.append(analysis)
 
     # Generate 3 content ideas based on top patterns
-    print(f"[llm] Generating content ideas…")
+    print(f"[llm] Generating content ideas…", file=sys.stderr)
     content_ideas = generate_content_ideas(client, top_10, analyses, model)
 
     # Prepare result
