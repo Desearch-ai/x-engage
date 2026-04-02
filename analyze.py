@@ -31,6 +31,26 @@ load_dotenv()
 CONFIG_PATH = os.environ.get("X_ENGAGE_CONFIG", Path(__file__).parent / "config.json")
 
 
+def _get_discord_token() -> str:
+    """
+    Load Discord bot token with fallback chain:
+    1. DISCORD_BOT_TOKEN env var (or .env file via dotenv)
+    2. ~/.openclaw/openclaw.json (same source as post-to-discord.cjs)
+    """
+    token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if token:
+        return token
+    try:
+        openclaw_cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+        cfg = json.loads(openclaw_cfg_path.read_text())
+        token = cfg.get("channels", {}).get("discord", {}).get("token", "")
+        if token:
+            print("[discord] Token loaded from ~/.openclaw/openclaw.json", file=sys.stderr)
+    except Exception as e:
+        print(f"[discord] Could not read openclaw.json: {e}", file=sys.stderr)
+    return token
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return json.load(f)
@@ -504,10 +524,12 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     )
 
     # Post digest to Discord
-    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    bot_token = _get_discord_token()
     channel_id = str(cfg["discord_channel_id"])
     if not bot_token:
-        raise RuntimeError("DISCORD_BOT_TOKEN not set in environment")
+        raise RuntimeError(
+            "DISCORD_BOT_TOKEN not set. Set it in .env, environment, or ~/.openclaw/openclaw.json"
+        )
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     discord_msgs = build_discord_messages(
