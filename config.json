@@ -13,5 +13,14 @@
     "views": 0.01,
     "quotes": 4,
     "bookmarks": 2
-  }
+  },
+  "x_accounts": [
+    {
+      "id": "personal",
+      "label": "@cosmicquantum (personal)",
+      "browser_profile": "~/.x-engage-browser/personal",
+      "active": true
+    }
+  ],
+  "active_account": "personal"
 }

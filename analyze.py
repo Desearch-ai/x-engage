@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
 x-engage: Engagement Analyzer + Discord Reporter
-Reads x-monitor tweets_window.json, scores posts, calls GPT-4o-mini
-for top-3 deep dives, generates content ideas, posts digest to Discord.
+Reads x-monitor tweets_window.json (24h sliding window), scores posts,
+runs GPT-4o-mini analysis on top-3 performers, generates content ideas
+for @desearch_ai, and posts a digest to Discord #x-alerts.
 
 Usage:
-    uv run python analyze.py              # Full run: analyze + post to Discord
-    uv run python analyze.py --dry-run    # Print JSON, no Discord post
+    python3 analyze.py              # Full run: analyze + post to Discord
+    python3 analyze.py --dry-run    # Print JSON to stdout, no Discord post
 """
 
 import argparse
 import json
 import os
 import sys
-import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,9 +30,47 @@ load_dotenv()
 
 CONFIG_PATH = os.environ.get("X_ENGAGE_CONFIG", Path(__file__).parent / "config.json")
 
+
+def _get_discord_token() -> str:
+    """
+    Load Discord bot token with fallback chain:
+    1. DISCORD_BOT_TOKEN env var (or .env file via dotenv)
+    2. ~/.openclaw/openclaw.json (same source as post-to-discord.cjs)
+    """
+    token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if token:
+        return token
+    try:
+        openclaw_cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+        cfg = json.loads(openclaw_cfg_path.read_text())
+        token = cfg.get("channels", {}).get("discord", {}).get("token", "")
+        if token:
+            print("[discord] Token loaded from ~/.openclaw/openclaw.json", file=sys.stderr)
+    except Exception as e:
+        print(f"[discord] Could not read openclaw.json: {e}", file=sys.stderr)
+    return token
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return json.load(f)
+
+
+def _get_active_account(cfg: dict) -> tuple[str, str]:
+    """
+    Return (account_id, account_label) for the currently active X account.
+    Multi-account: cfg.x_accounts is a list; cfg.active_account selects which one.
+    """
+    active_id = cfg.get("active_account", "personal")
+    accounts = cfg.get("x_accounts", [])
+    for acct in accounts:
+        if acct.get("id") == active_id:
+            return acct["id"], acct.get("label", f"@{active_id}")
+    # Fallback: first account or built-in default
+    if accounts:
+        return accounts[0]["id"], accounts[0].get("label", "@cosmicquantum (personal)")
+    return "personal", "@cosmicquantum (personal)"
+
 
 # ─────────────────────────────────────────────
 # Scoring
@@ -41,7 +79,7 @@ def load_config() -> dict:
 def score_tweet(tweet: dict, weights: dict) -> float:
     """
     score = likes*3 + retweets*5 + replies*2 + views*0.01 + quotes*4 + bookmarks*2
-    All fields default to 0 if None or missing.
+    All fields default to 0.0 if None or missing.
     """
     def _val(key: str) -> float:
         v = tweet.get(key)
@@ -56,6 +94,7 @@ def score_tweet(tweet: dict, weights: dict) -> float:
         + _val("bookmark_count") * weights.get("bookmarks", 2)
     )
 
+
 def get_top_tweets(tweets: list[dict], weights: dict, top_n: int) -> list[dict]:
     scored = []
     for t in tweets:
@@ -63,14 +102,15 @@ def get_top_tweets(tweets: list[dict], weights: dict, top_n: int) -> list[dict]:
         scored.append({**t, "_score": round(s, 2)})
     scored.sort(key=lambda x: x["_score"], reverse=True)
     # Deduplicate by tweet id
-    seen = set()
-    deduped = []
+    seen: set[str] = set()
+    deduped: list[dict] = []
     for t in scored:
         tid = t.get("id")
         if tid not in seen:
             seen.add(tid)
             deduped.append(t)
     return deduped[:top_n]
+
 
 # ─────────────────────────────────────────────
 # LLM Analysis
@@ -101,37 +141,6 @@ Return exactly this JSON shape (all fields required):
 }}
 """
 
-def analyse_tweet_with_llm(client: OpenAI, tweet: dict, model: str) -> dict:
-    username = tweet.get("user", {}).get("username", "unknown") if isinstance(tweet.get("user"), dict) else "unknown"
-    prompt = ANALYSIS_USER_TEMPLATE.format(
-        username=username,
-        text=tweet.get("text", "")[:500],
-        likes=tweet.get("like_count", 0),
-        rts=tweet.get("retweet_count", 0),
-        replies=tweet.get("reply_count", 0),
-        views=tweet.get("view_count", 0),
-        quotes=tweet.get("quote_count", 0),
-        bookmarks=tweet.get("bookmark_count", 0),
-        category=tweet.get("_monitor_category", "unknown"),
-        score=tweet.get("_score", 0),
-    )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": ANALYSIS_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.3,
-        max_tokens=400,
-    )
-    raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw)
-
 CONTENT_IDEAS_SYSTEM = """\
 You are a content strategist for @desearch_ai, an AI-powered search & scraping API on the Bittensor SN22 subnet.
 Based on the patterns in the top-performing tweets provided, generate 3 concrete content ideas.
@@ -159,16 +168,60 @@ Return exactly this JSON shape:
 ]
 """
 
+
+def _username(tweet: dict) -> str:
+    u = tweet.get("user")
+    if isinstance(u, dict):
+        return u.get("username", "?")
+    return "?"
+
+
+def _strip_markdown_fence(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return raw.strip()
+
+
+def analyse_tweet_with_llm(client: OpenAI, tweet: dict, model: str) -> dict:
+    username = _username(tweet)
+    prompt = ANALYSIS_USER_TEMPLATE.format(
+        username=username,
+        text=tweet.get("text", "")[:500],
+        likes=tweet.get("like_count", 0) or 0,
+        rts=tweet.get("retweet_count", 0) or 0,
+        replies=tweet.get("reply_count", 0) or 0,
+        views=tweet.get("view_count", 0) or 0,
+        quotes=tweet.get("quote_count", 0) or 0,
+        bookmarks=tweet.get("bookmark_count", 0) or 0,
+        category=tweet.get("_monitor_category", "unknown"),
+        score=tweet.get("_score", 0),
+    )
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": ANALYSIS_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        max_tokens=400,
+    )
+    raw = response.choices[0].message.content or ""
+    return json.loads(_strip_markdown_fence(raw))
+
+
 def generate_content_ideas(client: OpenAI, top_tweets: list[dict], analyses: list[dict], model: str) -> list[dict]:
     patterns = []
     for tweet, analysis in zip(top_tweets[:3], analyses):
-        username = tweet.get("user", {}).get("username", "?") if isinstance(tweet.get("user"), dict) else "?"
+        username = _username(tweet)
         patterns.append(
-            f"- @{username}: hook={analysis.get('hook_type','?')}, "
-            f"trigger={analysis.get('emotional_trigger','?')}, "
-            f"format={analysis.get('format','?')}, "
-            f"score={tweet.get('_score',0)}, "
-            f"text_snippet=\"{tweet.get('text','')[:120]}...\""
+            f"- @{username}: hook={analysis.get('hook_type', '?')}, "
+            f"trigger={analysis.get('emotional_trigger', '?')}, "
+            f"format={analysis.get('format', '?')}, "
+            f"score={tweet.get('_score', 0)}, "
+            f"text_snippet=\"{tweet.get('text', '')[:120]}...\""
         )
     patterns_summary = "\n".join(patterns) if patterns else "No pattern data available."
 
@@ -181,41 +234,37 @@ def generate_content_ideas(client: OpenAI, top_tweets: list[dict], analyses: lis
         temperature=0.7,
         max_tokens=700,
     )
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw)
+    raw = response.choices[0].message.content or ""
+    return json.loads(_strip_markdown_fence(raw))
+
 
 # ─────────────────────────────────────────────
-# Discord
+# Discord Formatting
 # ─────────────────────────────────────────────
 
-def _fmt_num(n: int | float) -> str:
+def _fmt_num(n: int | float | None) -> str:
     """Format large numbers compactly: 4200 → 4.2K"""
+    if n is None:
+        return "0"
     n = int(n)
     if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
+        return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
-        return f"{n/1_000:.1f}K"
+        return f"{n / 1_000:.1f}K"
     return str(n)
 
-def _username(tweet: dict) -> str:
-    u = tweet.get("user")
-    if isinstance(u, dict):
-        return u.get("username", "?")
-    return "?"
 
 def _truncate(text: str, max_len: int = 120) -> str:
     text = text.replace("\n", " ").strip()
-    return text if len(text) <= max_len else text[:max_len - 1] + "…"
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
 
 def build_discord_messages(
     top_10: list[dict],
     analyses: list[dict],
     content_ideas: list[dict],
     now_str: str,
+    account_label: str = "@cosmicquantum (personal)",
 ) -> list[dict]:
     """
     Returns list of Discord API message payloads (content strings).
@@ -240,47 +289,34 @@ def build_discord_messages(
         )
         header_lines.append(f"> {text_snip}")
     header_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
     messages.append({"content": "\n".join(header_lines)})
 
-    # ── Messages 2-4: Top 3 deep-dive cards ──────────────────────────────
-    emoji_map = {
-        "hook_type": {
-            "question": "❓",
-            "data": "📊",
-            "story": "📖",
-            "controversy": "🔥",
-            "announcement": "📣",
-            "list": "📋",
-        },
-        "emotional_trigger": {
-            "FOMO": "😰",
-            "curiosity": "🤔",
-            "identity": "🪞",
-            "social_proof": "👥",
-            "humor": "😂",
-            "inspiration": "✨",
-            "fear": "😱",
-        },
-    }
-
+    # ── Message 2: Deep Dive header ───────────────────────────────────────
     messages.append({"content": "🔍 **Top 3 Deep Dive**"})
+
+    # ── Messages 3-5: Top 3 cards ─────────────────────────────────────────
+    hook_emoji = {
+        "question": "❓", "data": "📊", "story": "📖",
+        "controversy": "🔥", "announcement": "📣", "list": "📋",
+    }
+    trigger_emoji = {
+        "FOMO": "😰", "curiosity": "🤔", "identity": "🪞",
+        "social_proof": "👥", "humor": "😂", "inspiration": "✨", "fear": "😱",
+    }
 
     for i, (tweet, analysis) in enumerate(zip(top_10[:3], analyses), 1):
         uname = _username(tweet)
         url = tweet.get("url", "")
         score = tweet.get("_score", 0)
-        likes = tweet.get("like_count", 0)
-        rts = tweet.get("retweet_count", 0)
-        replies = tweet.get("reply_count", 0)
-        views = tweet.get("view_count", 0)
-        quotes = tweet.get("quote_count", 0)
-        bookmarks = tweet.get("bookmark_count", 0)
+        likes = tweet.get("like_count", 0) or 0
+        rts = tweet.get("retweet_count", 0) or 0
+        replies = tweet.get("reply_count", 0) or 0
+        views = tweet.get("view_count", 0) or 0
+        quotes = tweet.get("quote_count", 0) or 0
+        bookmarks = tweet.get("bookmark_count", 0) or 0
 
         hook = analysis.get("hook_type", "?")
-        hook_emoji = emoji_map["hook_type"].get(hook, "📌")
         trigger = analysis.get("emotional_trigger", "?")
-        trigger_emoji = emoji_map["emotional_trigger"].get(trigger, "💡")
         fmt = analysis.get("format", "?")
         why = analysis.get("why_it_performed", "")
         fit = analysis.get("audience_fit_score", "?")
@@ -289,10 +325,11 @@ def build_discord_messages(
 
         card = [
             f"**#{i} @{uname}** · Score **{score:.0f}**",
-            f"```{_truncate(tweet.get('text',''), 200)}```",
+            f"```{_truncate(tweet.get('text', ''), 200)}```",
             f"❤️ {_fmt_num(likes)}  🔄 {_fmt_num(rts)}  💬 {replies}  "
             f"👁️ {_fmt_num(views)}  📝 {quotes}  🔖 {bookmarks}",
-            f"{hook_emoji} Hook: **{hook}**  {trigger_emoji} Trigger: **{trigger}**  📐 Format: **{fmt}**",
+            f"{hook_emoji.get(hook, '📌')} Hook: **{hook}**  "
+            f"{trigger_emoji.get(trigger, '💡')} Trigger: **{trigger}**  📐 Format: **{fmt}**",
             f"🎯 Audience Fit: **{fit}/10**",
             f"💡 _{why}_",
         ]
@@ -300,14 +337,14 @@ def build_discord_messages(
             card.append(f"🔑 Key elements: {elements_str}")
         if url:
             card.append(f"🔗 {url}")
+        # Account-labelled action buttons
         card.append(
-            f"\n**Actions:** 🔄 Retweet  |  💬 Quote  |  ⏭️ Skip\n"
-            f"_(approve in `pending_actions.json`)_"
+            f"\n**Actions:** 🔄 RT as {account_label}  |  💬 Quote as {account_label}  |  ⏭️ Skip\n"
+            f"_(set action in `pending_actions.json`)_"
         )
-
         messages.append({"content": "\n".join(card)})
 
-    # ── Message 5: Content Ideas ──────────────────────────────────────────
+    # ── Message 6: Content Ideas ──────────────────────────────────────────
     ideas_lines = ["━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "💡 **Content Ideas for @desearch_ai**"]
     for j, idea in enumerate(content_ideas, 1):
         title = idea.get("title", "")
@@ -320,10 +357,14 @@ def build_discord_messages(
             f"_Opener:_ \"{opener}\""
         )
     ideas_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
     messages.append({"content": "\n".join(ideas_lines)})
 
     return messages
+
+
+# ─────────────────────────────────────────────
+# Discord API
+# ─────────────────────────────────────────────
 
 def post_to_discord(channel_id: str, bot_token: str, messages: list[dict]) -> None:
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
@@ -332,24 +373,30 @@ def post_to_discord(channel_id: str, bot_token: str, messages: list[dict]) -> No
         "Content-Type": "application/json",
     }
     for msg in messages:
-        # Truncate if needed (Discord limit 2000 chars)
         content = msg["content"]
         if len(content) > 2000:
             content = content[:1997] + "…"
         resp = requests.post(url, headers=headers, json={"content": content})
         if not resp.ok:
-            print(f"[Discord] Failed to post: {resp.status_code} {resp.text[:200]}", file=sys.stderr)
+            print(f"[Discord] Failed: {resp.status_code} {resp.text[:200]}", file=sys.stderr)
         else:
-            print(f"[Discord] Posted message (len={len(content)})")
+            print(f"[Discord] Posted message (len={len(content)})", file=sys.stderr)
+
 
 # ─────────────────────────────────────────────
 # Pending Actions
 # ─────────────────────────────────────────────
 
-def write_pending_actions(top_3: list[dict], output_path: str) -> None:
+def write_pending_actions(
+    top_3: list[dict],
+    output_path: str,
+    account_id: str = "personal",
+    account_label: str = "@cosmicquantum (personal)",
+) -> None:
     """
     Write top-3 tweets to pending_actions.json for the X Action Executor.
     Status starts as 'pending' — human reviews and sets 'retweet'|'quote'|'skip'.
+    account_id + account_label tell the executor which X account to act from.
     """
     now = datetime.now(timezone.utc).isoformat()
     actions = []
@@ -360,26 +407,28 @@ def write_pending_actions(top_3: list[dict], output_path: str) -> None:
             "tweet_text": tweet.get("text", "")[:280],
             "author": _username(tweet),
             "score": tweet.get("_score", 0),
-            "action": "pending",   # human sets to: retweet | quote | skip
+            "action": "pending",       # human sets: retweet | quote | skip
+            "account_id": account_id,
+            "account_label": account_label,
             "timestamp": now,
         })
 
     path = Path(output_path)
-    # Merge with existing pending if file exists (don't overwrite unconditionally)
-    existing = []
+    # Merge with existing — only add tweets not already pending
+    existing: list[dict] = []
     if path.exists():
         try:
             existing = json.loads(path.read_text())
         except Exception:
             existing = []
 
-    # Deduplicate by tweet_id — only add new ones
     existing_ids = {a["tweet_id"] for a in existing}
     new_actions = [a for a in actions if a["tweet_id"] not in existing_ids]
     merged = existing + new_actions
 
     path.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
-    print(f"[pending_actions] Written {len(new_actions)} new entries → {path}")
+    print(f"[pending_actions] Written {len(new_actions)} new entries → {path}", file=sys.stderr)
+
 
 # ─────────────────────────────────────────────
 # Main
@@ -388,11 +437,15 @@ def write_pending_actions(top_3: list[dict], output_path: str) -> None:
 def run(dry_run: bool = False) -> dict[str, Any]:
     cfg = load_config()
 
-    # Load tweets
+    # Resolve active X account (multi-account-ready)
+    account_id, account_label = _get_active_account(cfg)
+    print(f"[analyze] Active account: {account_label} (id={account_id})", file=sys.stderr)
+
+    # Load tweets window
     window_path = Path(cfg["x_monitor_window_path"])
     if not window_path.exists():
         print(f"[warn] tweets_window.json not found at {window_path}, using empty list", file=sys.stderr)
-        tweets = []
+        tweets: list[dict] = []
     else:
         tweets = json.loads(window_path.read_text())
 
@@ -410,7 +463,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     top_10 = get_top_tweets(tweets, weights, top_n)
     print(f"[analyze] Top {len(top_10)} tweets selected", file=sys.stderr)
 
-    # LLM analysis (only top-3, not all 10 — cost-efficient)
+    # LLM: only top-3 get deep-dive (cost-efficient — not all 10)
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if not openai_key:
         raise RuntimeError("OPENAI_API_KEY not set in environment")
@@ -418,19 +471,19 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     client = OpenAI(api_key=openai_key)
     top_for_deep = top_10[:top_deep]
 
-    analyses = []
+    analyses: list[dict] = []
     for i, tweet in enumerate(top_for_deep, 1):
         uname = _username(tweet)
-        print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score',0):.1f})", file=sys.stderr)
+        print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score', 0):.1f})", file=sys.stderr)
         analysis = analyse_tweet_with_llm(client, tweet, model)
         analyses.append(analysis)
 
-    # Generate 3 content ideas based on top patterns
-    print(f"[llm] Generating content ideas…", file=sys.stderr)
+    # Generate 3 content ideas from detected top-performer patterns
+    print("[llm] Generating content ideas…", file=sys.stderr)
     content_ideas = generate_content_ideas(client, top_10, analyses, model)
 
-    # Prepare result
-    result = {
+    # Build result payload
+    result: dict[str, Any] = {
         "top_10": [
             {
                 "rank": i + 1,
@@ -439,42 +492,52 @@ def run(dry_run: bool = False) -> dict[str, Any]:
                 "author": _username(t),
                 "text": t.get("text", "")[:280],
                 "score": t.get("_score"),
-                "like_count": t.get("like_count", 0),
-                "retweet_count": t.get("retweet_count", 0),
-                "reply_count": t.get("reply_count", 0),
-                "view_count": t.get("view_count", 0),
-                "quote_count": t.get("quote_count", 0),
-                "bookmark_count": t.get("bookmark_count", 0),
+                "like_count": t.get("like_count", 0) or 0,
+                "retweet_count": t.get("retweet_count", 0) or 0,
+                "reply_count": t.get("reply_count", 0) or 0,
+                "view_count": t.get("view_count", 0) or 0,
+                "quote_count": t.get("quote_count", 0) or 0,
+                "bookmark_count": t.get("bookmark_count", 0) or 0,
                 "category": t.get("_monitor_category", ""),
             }
             for i, t in enumerate(top_10)
         ],
         "analyses": analyses,
         "content_ideas": content_ideas,
+        "active_account": {"id": account_id, "label": account_label},
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tweet_count_in_window": len(tweets),
     }
 
     if dry_run:
+        # Stdout = pure JSON; all logs were sent to stderr
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return result
 
-    # Write pending actions
+    # Write pending actions for human review
     pending_path = cfg.get("pending_actions_path", "pending_actions.json")
-    write_pending_actions(top_for_deep, pending_path)
+    write_pending_actions(
+        top_for_deep,
+        pending_path,
+        account_id=account_id,
+        account_label=account_label,
+    )
 
-    # Post to Discord
-    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    # Post digest to Discord
+    bot_token = _get_discord_token()
     channel_id = str(cfg["discord_channel_id"])
-
     if not bot_token:
-        raise RuntimeError("DISCORD_BOT_TOKEN not set in environment")
+        raise RuntimeError(
+            "DISCORD_BOT_TOKEN not set. Set it in .env, environment, or ~/.openclaw/openclaw.json"
+        )
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    discord_msgs = build_discord_messages(top_10, analyses, content_ideas, now_str)
+    discord_msgs = build_discord_messages(
+        top_10, analyses, content_ideas, now_str, account_label=account_label
+    )
     post_to_discord(channel_id, bot_token, discord_msgs)
+    print(f"[done] Engagement report posted to Discord #{channel_id}", file=sys.stderr)
 
-    print(f"[done] Engagement report posted to Discord #{channel_id}")
     return result
 
 
@@ -483,12 +546,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print analysis JSON to stdout, skip Discord post",
+        help="Print analysis JSON to stdout, skip Discord post and pending_actions write",
     )
     args = parser.parse_args()
 
     try:
-        result = run(dry_run=args.dry_run)
+        run(dry_run=args.dry_run)
         sys.exit(0)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
