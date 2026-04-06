@@ -1,7 +1,7 @@
 {
   "x_monitor_window_path": "/Users/giga/projects/openclaw/x-monitor/tweets_window.json",
   "discord_channel_id": "1477727527618347340",
-  "openai_model": "gpt-4o-mini",
+  "openai_model": "cerebras/gpt-oss-120b",
   "top_n": 10,
   "top_deep_dive": 3,
   "trigger_interval_hours": 4,

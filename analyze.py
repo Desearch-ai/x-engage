@@ -51,6 +51,25 @@ def _get_discord_token() -> str:
     return token
 
 
+def _get_cerebras_key() -> str:
+    """
+    Load Cerebras API key from openclaw.json.
+    Falls back to CEREBRAS_API_KEY env var.
+    """
+    key = os.environ.get("CEREBRAS_API_KEY", "")
+    if key:
+        return key
+    try:
+        openclaw_cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+        cfg = json.loads(openclaw_cfg_path.read_text())
+        key = cfg.get("models", {}).get("providers", {}).get("cerebras", {}).get("apiKey", "")
+        if key:
+            print("[cerebras] API key loaded from ~/.openclaw/openclaw.json", file=sys.stderr)
+    except Exception as e:
+        print(f"[cerebras] Could not read openclaw.json: {e}", file=sys.stderr)
+    return key
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return json.load(f)
@@ -464,11 +483,14 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     print(f"[analyze] Top {len(top_10)} tweets selected", file=sys.stderr)
 
     # LLM: only top-3 get deep-dive (cost-efficient — not all 10)
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if not openai_key:
-        raise RuntimeError("OPENAI_API_KEY not set in environment")
+    cerebras_key = _get_cerebras_key()
+    if not cerebras_key:
+        raise RuntimeError("CEREBRAS_API_KEY not set (env or openclaw.json)")
 
-    client = OpenAI(api_key=openai_key)
+    client = OpenAI(
+        base_url="https://api.cerebras.ai/v1",
+        api_key=cerebras_key,
+    )
     top_for_deep = top_10[:top_deep]
 
     analyses: list[dict] = []
