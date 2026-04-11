@@ -18,9 +18,18 @@
     {
       "id": "personal",
       "label": "@cosmicquantum (personal)",
+      "lane": "founder",
       "browser_profile": "~/.x-engage-browser/personal",
-      "active": true
+      "min_confidence": 0.7,
+      "action_types": ["retweet", "quote"]
+    },
+    {
+      "id": "brand",
+      "label": "@desearch_ai (brand)",
+      "lane": "brand",
+      "browser_profile": "~/.x-engage-browser/brand",
+      "min_confidence": 0.8,
+      "action_types": ["quote"]
     }
-  ],
-  "active_account": "personal"
+  ]
 }

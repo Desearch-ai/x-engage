@@ -56,20 +56,9 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def _get_active_account(cfg: dict) -> tuple[str, str]:
-    """
-    Return (account_id, account_label) for the currently active X account.
-    Multi-account: cfg.x_accounts is a list; cfg.active_account selects which one.
-    """
-    active_id = cfg.get("active_account", "personal")
-    accounts = cfg.get("x_accounts", [])
-    for acct in accounts:
-        if acct.get("id") == active_id:
-            return acct["id"], acct.get("label", f"@{active_id}")
-    # Fallback: first account or built-in default
-    if accounts:
-        return accounts[0]["id"], accounts[0].get("label", "@cosmicquantum (personal)")
-    return "personal", "@cosmicquantum (personal)"
+def get_accounts(cfg: dict) -> list[dict]:
+    """Return all configured X accounts. Replaces _get_active_account()."""
+    return cfg.get("x_accounts", [])
 
 
 # ─────────────────────────────────────────────
@@ -110,6 +99,37 @@ def get_top_tweets(tweets: list[dict], weights: dict, top_n: int) -> list[dict]:
             seen.add(tid)
             deduped.append(t)
     return deduped[:top_n]
+
+
+# ─────────────────────────────────────────────
+# Queue Generation
+# ─────────────────────────────────────────────
+
+def build_queue_items(tweets: list[dict], accounts: list[dict]) -> list[dict]:
+    """
+    Build richer queue items for each tweet × account pair.
+    Returns one item per (tweet, account) combination.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    items: list[dict] = []
+    for tweet in tweets:
+        for acct in accounts:
+            items.append({
+                "tweet_id": tweet.get("id", ""),
+                "tweet_url": tweet.get("url", ""),
+                "tweet_text": tweet.get("text", "")[:280],
+                "author": _username(tweet),
+                "score": tweet.get("_score", 0),
+                "action": "pending",
+                "account_id": acct["id"],
+                "account_label": acct.get("label", f"@{acct['id']}"),
+                "lane": acct.get("lane", "unknown"),
+                "action_types": acct.get("action_types", ["retweet", "quote"]),
+                "source": "x-engage-analyzer",
+                "category": tweet.get("_monitor_category", ""),
+                "timestamp": now,
+            })
+    return items
 
 
 # ─────────────────────────────────────────────
@@ -264,11 +284,12 @@ def build_discord_messages(
     analyses: list[dict],
     content_ideas: list[dict],
     now_str: str,
-    account_label: str = "@cosmicquantum (personal)",
+    accounts: list[dict] | None = None,
 ) -> list[dict]:
     """
     Returns list of Discord API message payloads (content strings).
     Split into multiple messages to stay under Discord's 2000-char limit.
+    accounts: list of account dicts from config (used to show per-account action labels).
     """
     messages = []
 
@@ -337,11 +358,21 @@ def build_discord_messages(
             card.append(f"🔑 Key elements: {elements_str}")
         if url:
             card.append(f"🔗 {url}")
-        # Account-labelled action buttons
-        card.append(
-            f"\n**Actions:** 🔄 RT as {account_label}  |  💬 Quote as {account_label}  |  ⏭️ Skip\n"
-            f"_(set action in `pending_actions.json`)_"
-        )
+        # Per-account action labels
+        if accounts:
+            action_parts = []
+            for acct in accounts:
+                label = acct.get("label", acct["id"])
+                action_parts.append(f"as **{label}**")
+            card.append(
+                f"\n**Actions:** 🔄 RT / 💬 Quote — {' | '.join(action_parts)}\n"
+                f"_(set action in `pending_actions.json`)_"
+            )
+        else:
+            card.append(
+                f"\n**Actions:** 🔄 RT  |  💬 Quote  |  ⏭️ Skip\n"
+                f"_(set action in `pending_actions.json`)_"
+            )
         messages.append({"content": "\n".join(card)})
 
     # ── Message 6: Content Ideas ──────────────────────────────────────────
@@ -387,34 +418,12 @@ def post_to_discord(channel_id: str, bot_token: str, messages: list[dict]) -> No
 # Pending Actions
 # ─────────────────────────────────────────────
 
-def write_pending_actions(
-    top_3: list[dict],
-    output_path: str,
-    account_id: str = "personal",
-    account_label: str = "@cosmicquantum (personal)",
-) -> None:
+def write_pending_actions(items: list[dict], output_path: str) -> None:
     """
-    Write top-3 tweets to pending_actions.json for the X Action Executor.
-    Status starts as 'pending' — human reviews and sets 'retweet'|'quote'|'skip'.
-    account_id + account_label tell the executor which X account to act from.
+    Write queue items to pending_actions.json for the X Action Executor.
+    Merges with existing entries, deduplicating by (tweet_id, account_id).
     """
-    now = datetime.now(timezone.utc).isoformat()
-    actions = []
-    for tweet in top_3:
-        actions.append({
-            "tweet_id": tweet.get("id", ""),
-            "tweet_url": tweet.get("url", ""),
-            "tweet_text": tweet.get("text", "")[:280],
-            "author": _username(tweet),
-            "score": tweet.get("_score", 0),
-            "action": "pending",       # human sets: retweet | quote | skip
-            "account_id": account_id,
-            "account_label": account_label,
-            "timestamp": now,
-        })
-
     path = Path(output_path)
-    # Merge with existing — only add tweets not already pending
     existing: list[dict] = []
     if path.exists():
         try:
@@ -422,12 +431,12 @@ def write_pending_actions(
         except Exception:
             existing = []
 
-    existing_ids = {a["tweet_id"] for a in existing}
-    new_actions = [a for a in actions if a["tweet_id"] not in existing_ids]
-    merged = existing + new_actions
+    existing_keys = {(a.get("tweet_id", ""), a.get("account_id", "")) for a in existing}
+    new_items = [i for i in items if (i.get("tweet_id", ""), i.get("account_id", "")) not in existing_keys]
+    merged = existing + new_items
 
     path.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
-    print(f"[pending_actions] Written {len(new_actions)} new entries → {path}", file=sys.stderr)
+    print(f"[pending_actions] Written {len(new_items)} new entries → {path}", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────
@@ -437,9 +446,13 @@ def write_pending_actions(
 def run(dry_run: bool = False) -> dict[str, Any]:
     cfg = load_config()
 
-    # Resolve active X account (multi-account-ready)
-    account_id, account_label = _get_active_account(cfg)
-    print(f"[analyze] Active account: {account_label} (id={account_id})", file=sys.stderr)
+    # Load all configured X accounts
+    accounts = get_accounts(cfg)
+    if not accounts:
+        print("[warn] No x_accounts configured in config.json", file=sys.stderr)
+    else:
+        labels = ", ".join(a.get("label", a["id"]) for a in accounts)
+        print(f"[analyze] Accounts: {labels}", file=sys.stderr)
 
     # Load tweets window
     window_path = Path(cfg["x_monitor_window_path"])
@@ -504,7 +517,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
         ],
         "analyses": analyses,
         "content_ideas": content_ideas,
-        "active_account": {"id": account_id, "label": account_label},
+        "accounts": [{"id": a["id"], "label": a.get("label", a["id"])} for a in accounts],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tweet_count_in_window": len(tweets),
     }
@@ -514,14 +527,10 @@ def run(dry_run: bool = False) -> dict[str, Any]:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return result
 
-    # Write pending actions for human review
+    # Write pending actions for human review — one item per tweet × account
     pending_path = cfg.get("pending_actions_path", "pending_actions.json")
-    write_pending_actions(
-        top_for_deep,
-        pending_path,
-        account_id=account_id,
-        account_label=account_label,
-    )
+    queue_items = build_queue_items(top_for_deep, accounts)
+    write_pending_actions(queue_items, pending_path)
 
     # Post digest to Discord
     bot_token = _get_discord_token()
@@ -533,7 +542,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     discord_msgs = build_discord_messages(
-        top_10, analyses, content_ideas, now_str, account_label=account_label
+        top_10, analyses, content_ideas, now_str, accounts=accounts
     )
     post_to_discord(channel_id, bot_token, discord_msgs)
     print(f"[done] Engagement report posted to Discord #{channel_id}", file=sys.stderr)
