@@ -48,6 +48,39 @@ BROWSER_PROFILE_DIR = Path(
     os.environ.get("X_BROWSER_PROFILE", Path.home() / ".x-engage-browser-profile")
 )
 DISCORD_CHANNEL_ID = "1477727527618347340"
+# ─── Anti-concurrency lock ────────────────────────────────────────────────
+LOCK_FILE = SCRIPT_DIR / ".executor.lock"
+
+
+def _is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_lock() -> bool:
+    """Acquire exclusive run lock. Return False if another instance holds it."""
+    if LOCK_FILE.exists():
+        try:
+            pid = int(LOCK_FILE.read_text().strip())
+            if _is_process_alive(pid):
+                print(f"[executor] Lock held by PID {pid} — another instance running. Exiting.", file=sys.stderr)
+                return False
+        except (ValueError, OSError):
+            pass
+        LOCK_FILE.unlink()
+    LOCK_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def release_lock():
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 # Timeouts (ms)
 PAGE_LOAD_TIMEOUT = 30_000    # 30s to load a tweet page
@@ -368,17 +401,19 @@ async def run_executor(dry_run: bool = False) -> int:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="x-engage: Execute approved X actions (retweet / quote tweet) via Playwright"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print actions that would be executed without launching any browser",
-    )
-    args = parser.parse_args()
-
+    if not acquire_lock():
+        sys.exit(1)
     try:
+        parser = argparse.ArgumentParser(
+            description="x-engage: Execute approved X actions (retweet / quote tweet) via Playwright"
+        )
+        parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Print actions that would be executed without launching any browser",
+        )
+        args = parser.parse_args()
+
         exit_code = asyncio.run(run_executor(dry_run=args.dry_run))
         sys.exit(exit_code)
     except KeyboardInterrupt:
@@ -387,3 +422,5 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[executor] Fatal error: {exc}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        release_lock()
