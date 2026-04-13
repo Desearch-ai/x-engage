@@ -11,16 +11,17 @@ Usage:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
 
 # ─────────────────────────────────────────────
 # Config & Env
@@ -29,6 +30,30 @@ from openai import OpenAI
 load_dotenv()
 
 CONFIG_PATH = os.environ.get("X_ENGAGE_CONFIG", Path(__file__).parent / "config.json")
+PENDING_ACTIONS_LOCK_NAME = ".pending_actions.lock"
+
+
+def atomic_write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False, encoding="utf-8") as tmp:
+        json.dump(data, tmp, indent=2, ensure_ascii=False)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def acquire_queue_lock(queue_path: Path):
+    lock_path = queue_path.parent / PENDING_ACTIONS_LOCK_NAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(f"pending_actions queue busy, lock held at {lock_path}")
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 
 def _get_discord_token() -> str:
@@ -189,6 +214,37 @@ Return exactly this JSON shape:
 """
 
 
+
+def build_fallback_analyses(top_tweets: list[dict]) -> list[dict]:
+    analyses = []
+    for tweet in top_tweets[:3]:
+        text = tweet.get("text", "")
+        hook_type = "question" if "?" in text else "announcement" if any(word in text.lower() for word in ["launch", "release", "ship", "new", "out"]) else "other"
+        analyses.append({
+            "hook_type": hook_type,
+            "format": "single_tweet",
+            "emotional_trigger": "curiosity",
+            "why_it_performed": "Dry-run fallback analysis: the post likely performed because it matched audience interest and current conversation timing.",
+            "audience_fit_score": 7,
+            "key_elements": [tweet.get("_monitor_category", "unknown") or "unknown", "dry-run fallback"],
+        })
+    return analyses
+
+
+def build_fallback_content_ideas(top_tweets: list[dict]) -> list[dict]:
+    categories = [t.get("_monitor_category", "AI") or "AI" for t in top_tweets[:3]] or ["AI"]
+    ideas = []
+    for index in range(3):
+        category = categories[index % len(categories)]
+        ideas.append({
+            "title": f"What builders keep missing about {category}",
+            "format": "single_tweet",
+            "hook_type": "data",
+            "angle": f"Use the current {category} conversation as a dry-run placeholder idea for Desearch positioning.",
+            "example_opener": f"Watching the latest {category} chatter, one pattern is obvious: teams still waste time stitching together search and crawl workflows.",
+        })
+    return ideas
+
 def _username(tweet: dict) -> str:
     u = tweet.get("user")
     if isinstance(u, dict):
@@ -205,7 +261,7 @@ def _strip_markdown_fence(raw: str) -> str:
     return raw.strip()
 
 
-def analyse_tweet_with_llm(client: OpenAI, tweet: dict, model: str) -> dict:
+def analyse_tweet_with_llm(client, tweet: dict, model: str) -> dict:
     username = _username(tweet)
     prompt = ANALYSIS_USER_TEMPLATE.format(
         username=username,
@@ -232,7 +288,7 @@ def analyse_tweet_with_llm(client: OpenAI, tweet: dict, model: str) -> dict:
     return json.loads(_strip_markdown_fence(raw))
 
 
-def generate_content_ideas(client: OpenAI, top_tweets: list[dict], analyses: list[dict], model: str) -> list[dict]:
+def generate_content_ideas(client, top_tweets: list[dict], analyses: list[dict], model: str) -> list[dict]:
     patterns = []
     for tweet, analysis in zip(top_tweets[:3], analyses):
         username = _username(tweet)
@@ -421,29 +477,57 @@ def post_to_discord(channel_id: str, bot_token: str, messages: list[dict]) -> No
 def write_pending_actions(items: list[dict], output_path: str) -> None:
     """
     Write queue items to pending_actions.json for the X Action Executor.
-    Merges with existing entries, deduplicating by (tweet_id, account_id).
+    Merges with existing entries, deduplicating by (tweet_id, account_id) while preserving review state.
     """
-    path = Path(output_path)
-    existing: list[dict] = []
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except Exception:
-            existing = []
+    path = Path(output_path).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).parent / path
 
-    existing_keys = {(a.get("tweet_id", ""), a.get("account_id", "")) for a in existing}
-    new_items = [i for i in items if (i.get("tweet_id", ""), i.get("account_id", "")) not in existing_keys]
-    merged = existing + new_items
+    lock_handle = acquire_queue_lock(path)
+    try:
+        existing: list[dict] = []
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except Exception:
+                existing = []
 
-    path.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
-    print(f"[pending_actions] Written {len(new_items)} new entries → {path}", file=sys.stderr)
+        existing_map = {(a.get("tweet_id", ""), a.get("account_id", "")): a for a in existing}
+        merged: list[dict] = []
+        refreshed = 0
+        new_count = 0
+
+        for item in items:
+            key = (item.get("tweet_id", ""), item.get("account_id", ""))
+            prior = existing_map.pop(key, None)
+            if prior is None:
+                merged.append(item)
+                new_count += 1
+                continue
+
+            preserved = {
+                key_name: prior[key_name]
+                for key_name in (
+                    "action", "status", "quote_text", "approved_at", "reviewed_at", "review_notes",
+                    "execution_started_at", "executed_at", "failed_at", "error"
+                )
+                if key_name in prior
+            }
+            merged.append({**item, **preserved})
+            refreshed += 1
+
+        merged.extend(existing_map.values())
+        atomic_write_json(path, merged)
+        print(f"[pending_actions] Written {new_count} new entries, refreshed {refreshed}, total {len(merged)} → {path}", file=sys.stderr)
+    finally:
+        lock_handle.close()
 
 
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 
-def run(dry_run: bool = False) -> dict[str, Any]:
+def run(dry_run: bool = False, skip_llm: bool = False) -> dict[str, Any]:
     cfg = load_config()
 
     # Load all configured X accounts
@@ -477,23 +561,31 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     print(f"[analyze] Top {len(top_10)} tweets selected", file=sys.stderr)
 
     # LLM: only top-3 get deep-dive (cost-efficient — not all 10)
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if not openai_key:
-        raise RuntimeError("OPENAI_API_KEY not set in environment")
-
-    client = OpenAI(api_key=openai_key)
     top_for_deep = top_10[:top_deep]
+    skip_llm = skip_llm or os.environ.get("X_ENGAGE_SKIP_LLM", "").lower() in {"1", "true", "yes"}
+    if skip_llm:
+        print("[llm] Skipping remote LLM calls, using dry-run fallback analysis", file=sys.stderr)
+        analyses = build_fallback_analyses(top_for_deep)
+        content_ideas = build_fallback_content_ideas(top_10)
+    else:
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise RuntimeError("OPENAI_API_KEY not set in environment")
 
-    analyses: list[dict] = []
-    for i, tweet in enumerate(top_for_deep, 1):
-        uname = _username(tweet)
-        print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score', 0):.1f})", file=sys.stderr)
-        analysis = analyse_tweet_with_llm(client, tweet, model)
-        analyses.append(analysis)
+        from openai import OpenAI
 
-    # Generate 3 content ideas from detected top-performer patterns
-    print("[llm] Generating content ideas…", file=sys.stderr)
-    content_ideas = generate_content_ideas(client, top_10, analyses, model)
+        client = OpenAI(api_key=openai_key)
+
+        analyses: list[dict] = []
+        for i, tweet in enumerate(top_for_deep, 1):
+            uname = _username(tweet)
+            print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score', 0):.1f})", file=sys.stderr)
+            analysis = analyse_tweet_with_llm(client, tweet, model)
+            analyses.append(analysis)
+
+        # Generate 3 content ideas from detected top-performer patterns
+        print("[llm] Generating content ideas…", file=sys.stderr)
+        content_ideas = generate_content_ideas(client, top_10, analyses, model)
 
     # Build result payload
     result: dict[str, Any] = {
@@ -520,6 +612,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
         "accounts": [{"id": a["id"], "label": a.get("label", a["id"])} for a in accounts],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tweet_count_in_window": len(tweets),
+        "llm_mode": "fallback" if skip_llm else "live",
     }
 
     if dry_run:
@@ -557,10 +650,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Print analysis JSON to stdout, skip Discord post and pending_actions write",
     )
+    parser.add_argument(
+        "--skip-llm",
+        action="store_true",
+        help="Use local fallback analysis/content ideas instead of remote LLM calls",
+    )
     args = parser.parse_args()
 
     try:
-        run(dry_run=args.dry_run)
+        run(dry_run=args.dry_run, skip_llm=args.skip_llm)
         sys.exit(0)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)

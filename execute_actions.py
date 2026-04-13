@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import asyncio
+import fcntl
 import json
 import os
 import sys
@@ -32,7 +33,13 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+except ModuleNotFoundError:
+    async_playwright = None
+
+    class PlaywrightTimeoutError(Exception):
+        pass
 
 # ─────────────────────────────────────────────
 # Config & Constants
@@ -44,7 +51,10 @@ SCRIPT_DIR = Path(__file__).parent
 PENDING_ACTIONS_PATH = Path(
     os.environ.get("PENDING_ACTIONS_PATH", SCRIPT_DIR / "pending_actions.json")
 )
+PENDING_ACTIONS_LOCK_NAME = ".pending_actions.lock"
 DISCORD_CHANNEL_ID = "1477727527618347340"
+LOCK_FILE = SCRIPT_DIR / ".executor.lock"
+_LEGACY_LOCK_HANDLE = None
 
 _DEFAULT_BROWSER_PROFILE = Path.home() / ".x-engage-browser-profile" / "default"
 
@@ -87,6 +97,54 @@ def get_browser_profile(cfg: dict, account_id: str) -> Path:
 # ─────────────────────────────────────────────
 # pending_actions.json helpers
 # ─────────────────────────────────────────────
+
+def acquire_lock() -> bool:
+    """Backward-compatible lock helper retained for existing tests/tooling."""
+    global _LEGACY_LOCK_HANDLE
+    if _LEGACY_LOCK_HANDLE is not None:
+        return False
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return False
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _LEGACY_LOCK_HANDLE = handle
+    return True
+
+
+def release_lock() -> None:
+    global _LEGACY_LOCK_HANDLE
+    if _LEGACY_LOCK_HANDLE is None:
+        try:
+            LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    _LEGACY_LOCK_HANDLE.close()
+    _LEGACY_LOCK_HANDLE = None
+    try:
+        LOCK_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def acquire_queue_lock(queue_path: Path):
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = queue_path.parent / PENDING_ACTIONS_LOCK_NAME
+    handle = lock_path.open("w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(f"pending_actions queue busy, lock held at {lock_path}")
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
 
 def load_actions() -> list[dict]:
     """Load pending_actions.json; returns [] if missing or unreadable."""
@@ -262,138 +320,138 @@ async def run_executor(dry_run: bool = False) -> int:
     Groups approved actions by account_id and opens a separate browser context
     per account using its configured profile directory.
     """
-    # Load config for account → browser profile mapping
     try:
         from analyze import load_config
         cfg = load_config()
     except Exception:
         cfg = {}
 
-    actions = load_actions()
-    approved = get_approved(actions)
+    lock_handle = acquire_queue_lock(PENDING_ACTIONS_PATH)
+    try:
+        actions = load_actions()
+        approved = get_approved(actions)
 
-    if not approved:
-        print("[executor] No approved actions found in pending_actions.json.")
-        return 0
+        if not approved:
+            print("[executor] No approved actions found in pending_actions.json.")
+            return 0
 
-    print(f"[executor] Found {len(approved)} approved action(s):")
-    for a in approved:
-        acct = a.get("account_id", "?")
-        print(f"  • [{a['action'].upper()}] @{a.get('author','?')} ({acct}) — {a['tweet_url']}")
-
-    # ── Dry-run: print + exit ─────────────────────────────────────────────
-    if dry_run:
-        print("\n[dry-run] Actions that would be executed:")
+        print(f"[executor] Found {len(approved)} approved action(s):")
         for a in approved:
             acct = a.get("account_id", "?")
-            print(f"  → {a['action'].upper()} tweet {a['tweet_id']} by @{a.get('author','?')} as {acct}")
-            if a["action"] == "quote":
-                qt = a.get("quote_text", "")
-                print(f"     quote_text: {qt[:120]}{'…' if len(qt) > 120 else ''}")
-        print("[dry-run] Done (no browser launched).")
-        return 0
+            print(f"  • [{a['action'].upper()}] @{a.get('author','?')} ({acct}) — {a['tweet_url']}")
 
-    # ── Live execution ────────────────────────────────────────────────────
-    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
-    if not bot_token:
-        print("[warn] DISCORD_BOT_TOKEN not set — Discord confirmations will be skipped.", file=sys.stderr)
+        if dry_run:
+            print("\n[dry-run] Actions that would be executed:")
+            for a in approved:
+                acct = a.get("account_id", "?")
+                print(f"  → {a['action'].upper()} tweet {a['tweet_id']} by @{a.get('author','?')} as {acct}")
+                if a["action"] == "quote":
+                    qt = a.get("quote_text", "")
+                    print(f"     quote_text: {qt[:120]}{'…' if len(qt) > 120 else ''}")
+            print("[dry-run] Done (no browser launched).")
+            return 0
 
-    any_failed = False
+        if async_playwright is None:
+            raise RuntimeError("playwright is not installed. Run `uv run playwright install chromium` after syncing dependencies.")
 
-    # Group approved actions by account_id so each account uses its own browser context
-    account_groups: dict[str, list[dict]] = {}
-    for item in actions:
-        if item.get("status") != "approved" or item.get("action") not in ("retweet", "quote"):
-            continue
-        acct_id = item.get("account_id", "default")
-        account_groups.setdefault(acct_id, []).append(item)
+        bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+        if not bot_token:
+            print("[warn] DISCORD_BOT_TOKEN not set — Discord confirmations will be skipped.", file=sys.stderr)
 
-    async with async_playwright() as p:
-        for acct_id, acct_items in account_groups.items():
-            profile_dir = get_browser_profile(cfg, acct_id)
-            profile_dir.mkdir(parents=True, exist_ok=True)
-            print(f"\n[executor] Account '{acct_id}' — profile: {profile_dir}")
+        any_failed = False
+        account_groups: dict[str, list[dict]] = {}
+        for item in actions:
+            if item.get("status") != "approved" or item.get("action") not in ("retweet", "quote"):
+                continue
+            acct_id = item.get("account_id", "default")
+            account_groups.setdefault(acct_id, []).append(item)
 
-            context = await p.chromium.launch_persistent_context(
-                str(profile_dir),
-                headless=False,
-                viewport={"width": 1280, "height": 800},
-                locale="en-US",
-                args=["--no-sandbox"],
-            )
-            page = context.pages[0] if context.pages else await context.new_page()
+        async with async_playwright() as p:
+            for acct_id, acct_items in account_groups.items():
+                profile_dir = get_browser_profile(cfg, acct_id)
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                print(f"\n[executor] Account '{acct_id}' — profile: {profile_dir}")
 
-            # Quick check: are we logged into X?
-            try:
-                await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-                await page.wait_for_timeout(2000)
-                if "login" in page.url.lower() or "signin" in page.url.lower():
-                    print(
-                        f"\n⚠️  Account '{acct_id}' is not logged into X.com!\n"
-                        "   The browser will remain open.\n"
-                        "   Please log in manually, then re-run this script.\n",
-                        file=sys.stderr,
-                    )
-                    await context.close()
-                    any_failed = True
-                    continue
-            except Exception as exc:
-                print(f"[warn] Could not check X.com login status for '{acct_id}': {exc}", file=sys.stderr)
-
-            for item in acct_items:
-                tweet_id    = item.get("tweet_id", "?")
-                tweet_url   = item.get("tweet_url", "")
-                action_type = item.get("action")
-                quote_text  = item.get("quote_text", "")
-                author      = item.get("author", "?")
-
-                print(f"\n[executor] ── Processing: {action_type.upper()} @{author} ({tweet_id}) as '{acct_id}' ──")
-
-                success   = False
-                error_msg = ""
+                context = await p.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    headless=False,
+                    viewport={"width": 1280, "height": 800},
+                    locale="en-US",
+                    args=["--no-sandbox"],
+                )
+                page = context.pages[0] if context.pages else await context.new_page()
 
                 try:
-                    if action_type == "retweet":
-                        await execute_retweet(page, tweet_url)
-                    elif action_type == "quote":
-                        if not quote_text:
-                            raise ValueError("action=quote requires a non-empty quote_text field")
-                        await execute_quote(page, tweet_url, quote_text)
-
-                    item["status"]      = "done"
-                    item["executed_at"] = datetime.now(timezone.utc).isoformat()
-                    success = True
-                    print(f"[executor] ✓ {action_type} completed for tweet {tweet_id}")
-
+                    await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                    await page.wait_for_timeout(2000)
+                    if "login" in page.url.lower() or "signin" in page.url.lower():
+                        print(
+                            f"\n⚠️  Account '{acct_id}' is not logged into X.com!\n"
+                            "   The browser will remain open.\n"
+                            "   Please log in manually, then re-run this script.\n",
+                            file=sys.stderr,
+                        )
+                        await context.close()
+                        any_failed = True
+                        continue
                 except Exception as exc:
-                    error_msg = str(exc)
-                    item["status"]    = "failed"
-                    item["error"]     = error_msg
-                    item["failed_at"] = datetime.now(timezone.utc).isoformat()
-                    any_failed = True
-                    print(f"[executor] ✗ {action_type} FAILED for {tweet_id}: {error_msg}", file=sys.stderr)
+                    print(f"[warn] Could not check X.com login status for '{acct_id}': {exc}", file=sys.stderr)
 
-                # Persist state after every action so partial progress is saved
-                save_actions(actions)
+                for item in acct_items:
+                    tweet_id = item.get("tweet_id", "?")
+                    tweet_url = item.get("tweet_url", "")
+                    action_type = item.get("action")
+                    quote_text = item.get("quote_text", "")
+                    author = item.get("author", "?")
 
-                # Discord confirmation (success or failure)
-                post_confirmation(bot_token, item, success, error_msg)
+                    print(f"\n[executor] ── Processing: {action_type.upper()} @{author} ({tweet_id}) as '{acct_id}' ──")
 
-                # Polite delay between actions within the same account
-                remaining = any(
-                    a.get("status") == "approved" and a.get("action") in ("retweet", "quote")
-                    for a in acct_items
-                )
-                if remaining:
-                    await page.wait_for_timeout(BETWEEN_ACTIONS)
+                    success = False
+                    error_msg = ""
 
-            await context.close()
+                    try:
+                        item["status"] = "executing"
+                        item["execution_started_at"] = datetime.now(timezone.utc).isoformat()
+                        save_actions(actions)
 
-    total   = len(approved)
-    done    = sum(1 for a in actions if a.get("status") == "done")
-    failed  = sum(1 for a in actions if a.get("status") == "failed")
-    print(f"\n[executor] Summary: {done} done, {failed} failed out of {total} approved actions.")
-    return 1 if any_failed else 0
+                        if action_type == "retweet":
+                            await execute_retweet(page, tweet_url)
+                        elif action_type == "quote":
+                            if not quote_text:
+                                raise ValueError("action=quote requires a non-empty quote_text field")
+                            await execute_quote(page, tweet_url, quote_text)
+
+                        item["status"] = "done"
+                        item["executed_at"] = datetime.now(timezone.utc).isoformat()
+                        success = True
+                        print(f"[executor] ✓ {action_type} completed for tweet {tweet_id}")
+                    except Exception as exc:
+                        error_msg = str(exc)
+                        item["status"] = "failed"
+                        item["error"] = error_msg
+                        item["failed_at"] = datetime.now(timezone.utc).isoformat()
+                        any_failed = True
+                        print(f"[executor] ✗ {action_type} FAILED for {tweet_id}: {error_msg}", file=sys.stderr)
+
+                    save_actions(actions)
+                    post_confirmation(bot_token, item, success, error_msg)
+
+                    remaining = any(
+                        a.get("status") == "approved" and a.get("action") in ("retweet", "quote")
+                        for a in acct_items
+                    )
+                    if remaining:
+                        await page.wait_for_timeout(BETWEEN_ACTIONS)
+
+                await context.close()
+
+        total = len(approved)
+        done = sum(1 for a in actions if a.get("status") == "done")
+        failed = sum(1 for a in actions if a.get("status") == "failed")
+        print(f"\n[executor] Summary: {done} done, {failed} failed out of {total} approved actions.")
+        return 1 if any_failed else 0
+    finally:
+        lock_handle.close()
 
 # ─────────────────────────────────────────────
 # Entry point
