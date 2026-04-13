@@ -57,8 +57,8 @@ uv run playwright install chromium
 
 ### First-time X.com login
 
-`execute_actions.py` uses a **persistent browser profile** at `~/.x-engage-browser-profile/`.
-On the very first run the browser will open to `x.com`. Log in manually — your session will be saved for all future runs.
+`execute_actions.py` uses **per-account persistent browser profiles** defined in `config.json` (`browser_profile` field per account, e.g. `~/.x-engage-browser/personal` and `~/.x-engage-browser/brand`).
+On the very first run for each account the browser will open to `x.com`. Log in to the correct account manually — the session is saved for all future runs.
 
 ### The cron job (already created)
 
@@ -121,20 +121,29 @@ GPT-4o-mini is called **only for the top-3 posts** (not all 10), keeping cost mi
 
 ## `pending_actions.json` schema
 
+Each entry represents one **tweet × account** pair. The same tweet appears once per account.
+
 ```json
 [{
   "tweet_id":     "123",
   "tweet_url":    "https://x.com/user/status/123",
   "tweet_text":   "...",
   "author":       "username",
+  "score":        650.0,
   "action":       "pending | retweet | quote",
   "quote_text":   "(required for action=quote)",
   "status":       "pending | approved | done | skipped | failed",
   "account_id":   "personal",
   "account_label":"@cosmicquantum (personal)",
+  "lane":         "founder | brand",
+  "action_types": ["retweet", "quote"],
+  "source":       "x-engage-analyzer",
+  "category":     "ai",
   "timestamp":    "2026-..."
 }]
 ```
+
+Deduplication key is `(tweet_id, account_id)` — re-running `analyze.py` never adds duplicates.
 
 Set `action=retweet` or `action=quote` + `status=approved` to queue for execution.
 After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `error` field).
@@ -145,21 +154,32 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
 
 ```json
 {
-  "x_monitor_window_path": "/Users/giga/projects/openclaw/x-monitor/tweets_window.json",
+  "x_monitor_window_path": "/path/to/x-monitor/tweets_window.json",
   "discord_channel_id": "1477727527618347340",
   "openai_model": "gpt-4o-mini",
   "top_n": 10,
   "top_deep_dive": 3,
   "trigger_interval_hours": 4,
+  "pending_actions_path": "pending_actions.json",
+  "score_weights": { "likes": 3, "retweets": 5, "replies": 2, "views": 0.01, "quotes": 4, "bookmarks": 2 },
   "x_accounts": [
     {
       "id": "personal",
       "label": "@cosmicquantum (personal)",
+      "lane": "founder",
       "browser_profile": "~/.x-engage-browser/personal",
-      "active": true
+      "min_confidence": 0.7,
+      "action_types": ["retweet", "quote"]
+    },
+    {
+      "id": "brand",
+      "label": "@desearch_ai (brand)",
+      "lane": "brand",
+      "browser_profile": "~/.x-engage-browser/brand",
+      "min_confidence": 0.8,
+      "action_types": ["quote"]
     }
-  ],
-  "active_account": "personal"
+  ]
 }
 ```
 
@@ -167,19 +187,11 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
 
 ## Multi-Account Architecture
 
-Config supports N accounts from day one. To add a second account:
+`analyze.py` generates one `pending_actions.json` entry **per tweet × account**. All accounts in `x_accounts` are processed — there is no `active_account` toggle.
 
-```json
-{
-  "x_accounts": [
-    { "id": "personal", "label": "@cosmicquantum (personal)", "active": true },
-    { "id": "desearch", "label": "@desearch_ai (brand)", "active": false }
-  ],
-  "active_account": "personal"
-}
-```
+`execute_actions.py` groups approved actions by `account_id` and opens a **separate Chromium browser context** per account (each with its own `browser_profile`), so sessions never cross-contaminate.
 
-Set `active_account` to switch which account's label appears in Discord buttons and `pending_actions.json`.
+To add a new account: append an entry to `x_accounts` with its own `id`, `lane`, `browser_profile`, and `action_types`. No code changes required.
 
 ---
 
