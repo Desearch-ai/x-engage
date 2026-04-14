@@ -9,15 +9,16 @@ Two-part system for Desearch AI's X/Twitter engagement workflow:
 
 ## What happens when you merge?
 
-1. **A cron job runs automatically every 4 hours** via OpenClaw (cron ID: `b046db40-f90c-4185-8fdd-d54fe6c552e0`).
+1. **Analysis runs automatically every 4 hours** via OpenClaw (re-enable around `bash run-engage.sh analyze`).
 2. It reads `tweets_window.json` from x-monitor (24h sliding window, ~100 tweets).
 3. Scores every tweet: `score = likes×3 + rts×5 + replies×2 + views×0.01 + quotes×4 + bookmarks×2`
 4. Picks the top 10. Runs GPT-4o-mini on **top 3 only** (cost-efficient).
 5. Generates 3 content ideas for @desearch_ai based on the patterns.
 6. Posts a 6-message digest to **Discord `#x-alerts` (channel `1477727527618347340`)**.
-7. Writes `pending_actions.json` with the top 3 tweets for RT/Quote approval.
+7. Writes `pending_actions.json` with the top 3 tweets for RT/Quote approval, using an exclusive queue lock and atomic replace semantics.
+8. Live execution remains a separate step, behind manual approval and an explicit env gate.
 
-**After merging → engagement reports appear in Discord automatically, no action needed.**
+**After merging → analysis reports appear in Discord automatically. Live X account actions still require approval first.**
 
 ---
 
@@ -57,13 +58,18 @@ uv run playwright install chromium
 
 ### First-time X.com login
 
-`execute_actions.py` uses a **persistent browser profile** at `~/.x-engage-browser-profile/`.
-On the very first run the browser will open to `x.com`. Log in manually — your session will be saved for all future runs.
+`execute_actions.py` uses **per-account persistent browser profiles** defined in `config.json` (`browser_profile` field per account, e.g. `~/.x-engage-browser/personal` and `~/.x-engage-browser/brand`).
+On the very first run for each account the browser will open to `x.com`. Log in to the correct account manually — the session is saved for all future runs.
 
-### The cron job (already created)
+### Runtime cadence
 
-The OpenClaw cron job `X Engage — Engagement Report (4h)` is already active.
-Check it: `openclaw cron list | grep Engage`
+Recommended cadence:
+- every 4h: `bash run-engage.sh analyze`
+- operator review window after each digest
+- optional/manual validation: `bash run-engage.sh execute-dry-run`
+- live execution only when explicitly approved: `X_ENGAGE_ENABLE_LIVE_EXECUTION=1 bash run-engage.sh execute-live`
+
+Do not bundle analysis and live execution into one unattended cron.
 
 ---
 
@@ -76,9 +82,12 @@ python3 analyze.py --dry-run    # Dry run: prints JSON, no Discord post
 python3 analyze.py              # Live run: posts to Discord #x-alerts
 ```
 
-Or via shell wrapper (used by cron):
+Or via the safe shell wrapper:
 ```bash
-bash run-engage.sh
+bash run-engage.sh analyze
+bash run-engage.sh analyze-dry-run
+bash run-engage.sh execute-dry-run
+X_ENGAGE_ENABLE_LIVE_EXECUTION=1 bash run-engage.sh execute-live
 ```
 
 ### Action Executor (`execute_actions.py`)
@@ -121,20 +130,29 @@ GPT-4o-mini is called **only for the top-3 posts** (not all 10), keeping cost mi
 
 ## `pending_actions.json` schema
 
+Each entry represents one **tweet × account** pair. The same tweet appears once per account.
+
 ```json
 [{
   "tweet_id":     "123",
   "tweet_url":    "https://x.com/user/status/123",
   "tweet_text":   "...",
   "author":       "username",
+  "score":        650.0,
   "action":       "pending | retweet | quote",
   "quote_text":   "(required for action=quote)",
   "status":       "pending | approved | done | skipped | failed",
   "account_id":   "personal",
   "account_label":"@cosmicquantum (personal)",
+  "lane":         "founder | brand",
+  "action_types": ["retweet", "quote"],
+  "source":       "x-engage-analyzer",
+  "category":     "ai",
   "timestamp":    "2026-..."
 }]
 ```
+
+Deduplication key is `(tweet_id, account_id)` — re-running `analyze.py` never adds duplicates.
 
 Set `action=retweet` or `action=quote` + `status=approved` to queue for execution.
 After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `error` field).
@@ -145,21 +163,32 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
 
 ```json
 {
-  "x_monitor_window_path": "/Users/giga/projects/openclaw/x-monitor/tweets_window.json",
+  "x_monitor_window_path": "/path/to/x-monitor/tweets_window.json",
   "discord_channel_id": "1477727527618347340",
   "openai_model": "gpt-4o-mini",
   "top_n": 10,
   "top_deep_dive": 3,
   "trigger_interval_hours": 4,
+  "pending_actions_path": "pending_actions.json",
+  "score_weights": { "likes": 3, "retweets": 5, "replies": 2, "views": 0.01, "quotes": 4, "bookmarks": 2 },
   "x_accounts": [
     {
       "id": "personal",
       "label": "@cosmicquantum (personal)",
+      "lane": "founder",
       "browser_profile": "~/.x-engage-browser/personal",
-      "active": true
+      "min_confidence": 0.7,
+      "action_types": ["retweet", "quote"]
+    },
+    {
+      "id": "brand",
+      "label": "@desearch_ai (brand)",
+      "lane": "brand",
+      "browser_profile": "~/.x-engage-browser/brand",
+      "min_confidence": 0.8,
+      "action_types": ["quote"]
     }
-  ],
-  "active_account": "personal"
+  ]
 }
 ```
 
@@ -167,19 +196,11 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
 
 ## Multi-Account Architecture
 
-Config supports N accounts from day one. To add a second account:
+`analyze.py` generates one `pending_actions.json` entry **per tweet × account**. All accounts in `x_accounts` are processed — there is no `active_account` toggle.
 
-```json
-{
-  "x_accounts": [
-    { "id": "personal", "label": "@cosmicquantum (personal)", "active": true },
-    { "id": "desearch", "label": "@desearch_ai (brand)", "active": false }
-  ],
-  "active_account": "personal"
-}
-```
+`execute_actions.py` groups approved actions by `account_id` and opens a **separate Chromium browser context** per account (each with its own `browser_profile`), so sessions never cross-contaminate. It now claims the shared queue lock before execution and marks each item as `executing` before a live browser action, so crashes remain visible instead of silently re-running the same approval.
 
-Set `active_account` to switch which account's label appears in Discord buttons and `pending_actions.json`.
+To add a new account: append an entry to `x_accounts` with its own `id`, `lane`, `browser_profile`, and `action_types`. No code changes required.
 
 ---
 

@@ -1,7 +1,7 @@
 {
   "x_monitor_window_path": "/Users/giga/projects/openclaw/x-monitor/tweets_window.json",
   "discord_channel_id": "1477727527618347340",
-  "openai_model": "cerebras/gpt-oss-120b",
+  "openai_model": "gpt-4o-mini",
   "top_n": 10,
   "top_deep_dive": 3,
   "trigger_interval_hours": 4,
@@ -18,9 +18,18 @@
     {
       "id": "personal",
       "label": "@cosmicquantum (personal)",
+      "lane": "founder",
       "browser_profile": "~/.x-engage-browser/personal",
-      "active": true
+      "min_confidence": 0.7,
+      "action_types": ["retweet", "quote"]
+    },
+    {
+      "id": "brand",
+      "label": "@desearch_ai (brand)",
+      "lane": "brand",
+      "browser_profile": "~/.x-engage-browser/brand",
+      "min_confidence": 0.8,
+      "action_types": ["quote"]
     }
-  ],
-  "active_account": "personal"
+  ]
 }

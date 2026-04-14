@@ -11,16 +11,17 @@ Usage:
 """
 
 import argparse
+import fcntl
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
 
 # ─────────────────────────────────────────────
 # Config & Env
@@ -29,6 +30,30 @@ from openai import OpenAI
 load_dotenv()
 
 CONFIG_PATH = os.environ.get("X_ENGAGE_CONFIG", Path(__file__).parent / "config.json")
+PENDING_ACTIONS_LOCK_NAME = ".pending_actions.lock"
+
+
+def atomic_write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False, encoding="utf-8") as tmp:
+        json.dump(data, tmp, indent=2, ensure_ascii=False)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def acquire_queue_lock(queue_path: Path):
+    lock_path = queue_path.parent / PENDING_ACTIONS_LOCK_NAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError(f"pending_actions queue busy, lock held at {lock_path}")
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 
 def _get_discord_token() -> str:
@@ -51,44 +76,14 @@ def _get_discord_token() -> str:
     return token
 
 
-def _get_cerebras_key() -> str:
-    """
-    Load Cerebras API key from openclaw.json.
-    Falls back to CEREBRAS_API_KEY env var.
-    """
-    key = os.environ.get("CEREBRAS_API_KEY", "")
-    if key:
-        return key
-    try:
-        openclaw_cfg_path = Path.home() / ".openclaw" / "openclaw.json"
-        cfg = json.loads(openclaw_cfg_path.read_text())
-        key = cfg.get("models", {}).get("providers", {}).get("cerebras", {}).get("apiKey", "")
-        if key:
-            print("[cerebras] API key loaded from ~/.openclaw/openclaw.json", file=sys.stderr)
-    except Exception as e:
-        print(f"[cerebras] Could not read openclaw.json: {e}", file=sys.stderr)
-    return key
-
-
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
 
-def _get_active_account(cfg: dict) -> tuple[str, str]:
-    """
-    Return (account_id, account_label) for the currently active X account.
-    Multi-account: cfg.x_accounts is a list; cfg.active_account selects which one.
-    """
-    active_id = cfg.get("active_account", "personal")
-    accounts = cfg.get("x_accounts", [])
-    for acct in accounts:
-        if acct.get("id") == active_id:
-            return acct["id"], acct.get("label", f"@{active_id}")
-    # Fallback: first account or built-in default
-    if accounts:
-        return accounts[0]["id"], accounts[0].get("label", "@cosmicquantum (personal)")
-    return "personal", "@cosmicquantum (personal)"
+def get_accounts(cfg: dict) -> list[dict]:
+    """Return all configured X accounts. Replaces _get_active_account()."""
+    return cfg.get("x_accounts", [])
 
 
 # ─────────────────────────────────────────────
@@ -129,6 +124,37 @@ def get_top_tweets(tweets: list[dict], weights: dict, top_n: int) -> list[dict]:
             seen.add(tid)
             deduped.append(t)
     return deduped[:top_n]
+
+
+# ─────────────────────────────────────────────
+# Queue Generation
+# ─────────────────────────────────────────────
+
+def build_queue_items(tweets: list[dict], accounts: list[dict]) -> list[dict]:
+    """
+    Build richer queue items for each tweet × account pair.
+    Returns one item per (tweet, account) combination.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    items: list[dict] = []
+    for tweet in tweets:
+        for acct in accounts:
+            items.append({
+                "tweet_id": tweet.get("id", ""),
+                "tweet_url": tweet.get("url", ""),
+                "tweet_text": tweet.get("text", "")[:280],
+                "author": _username(tweet),
+                "score": tweet.get("_score", 0),
+                "action": "pending",
+                "account_id": acct["id"],
+                "account_label": acct.get("label", f"@{acct['id']}"),
+                "lane": acct.get("lane", "unknown"),
+                "action_types": acct.get("action_types", ["retweet", "quote"]),
+                "source": "x-engage-analyzer",
+                "category": tweet.get("_monitor_category", ""),
+                "timestamp": now,
+            })
+    return items
 
 
 # ─────────────────────────────────────────────
@@ -188,6 +214,37 @@ Return exactly this JSON shape:
 """
 
 
+
+def build_fallback_analyses(top_tweets: list[dict]) -> list[dict]:
+    analyses = []
+    for tweet in top_tweets[:3]:
+        text = tweet.get("text", "")
+        hook_type = "question" if "?" in text else "announcement" if any(word in text.lower() for word in ["launch", "release", "ship", "new", "out"]) else "other"
+        analyses.append({
+            "hook_type": hook_type,
+            "format": "single_tweet",
+            "emotional_trigger": "curiosity",
+            "why_it_performed": "Dry-run fallback analysis: the post likely performed because it matched audience interest and current conversation timing.",
+            "audience_fit_score": 7,
+            "key_elements": [tweet.get("_monitor_category", "unknown") or "unknown", "dry-run fallback"],
+        })
+    return analyses
+
+
+def build_fallback_content_ideas(top_tweets: list[dict]) -> list[dict]:
+    categories = [t.get("_monitor_category", "AI") or "AI" for t in top_tweets[:3]] or ["AI"]
+    ideas = []
+    for index in range(3):
+        category = categories[index % len(categories)]
+        ideas.append({
+            "title": f"What builders keep missing about {category}",
+            "format": "single_tweet",
+            "hook_type": "data",
+            "angle": f"Use the current {category} conversation as a dry-run placeholder idea for Desearch positioning.",
+            "example_opener": f"Watching the latest {category} chatter, one pattern is obvious: teams still waste time stitching together search and crawl workflows.",
+        })
+    return ideas
+
 def _username(tweet: dict) -> str:
     u = tweet.get("user")
     if isinstance(u, dict):
@@ -204,7 +261,7 @@ def _strip_markdown_fence(raw: str) -> str:
     return raw.strip()
 
 
-def analyse_tweet_with_llm(client: OpenAI, tweet: dict, model: str) -> dict:
+def analyse_tweet_with_llm(client, tweet: dict, model: str) -> dict:
     username = _username(tweet)
     prompt = ANALYSIS_USER_TEMPLATE.format(
         username=username,
@@ -231,7 +288,7 @@ def analyse_tweet_with_llm(client: OpenAI, tweet: dict, model: str) -> dict:
     return json.loads(_strip_markdown_fence(raw))
 
 
-def generate_content_ideas(client: OpenAI, top_tweets: list[dict], analyses: list[dict], model: str) -> list[dict]:
+def generate_content_ideas(client, top_tweets: list[dict], analyses: list[dict], model: str) -> list[dict]:
     patterns = []
     for tweet, analysis in zip(top_tweets[:3], analyses):
         username = _username(tweet)
@@ -283,11 +340,12 @@ def build_discord_messages(
     analyses: list[dict],
     content_ideas: list[dict],
     now_str: str,
-    account_label: str = "@cosmicquantum (personal)",
+    accounts: list[dict] | None = None,
 ) -> list[dict]:
     """
     Returns list of Discord API message payloads (content strings).
     Split into multiple messages to stay under Discord's 2000-char limit.
+    accounts: list of account dicts from config (used to show per-account action labels).
     """
     messages = []
 
@@ -356,11 +414,21 @@ def build_discord_messages(
             card.append(f"🔑 Key elements: {elements_str}")
         if url:
             card.append(f"🔗 {url}")
-        # Account-labelled action buttons
-        card.append(
-            f"\n**Actions:** 🔄 RT as {account_label}  |  💬 Quote as {account_label}  |  ⏭️ Skip\n"
-            f"_(set action in `pending_actions.json`)_"
-        )
+        # Per-account action labels
+        if accounts:
+            action_parts = []
+            for acct in accounts:
+                label = acct.get("label", acct["id"])
+                action_parts.append(f"as **{label}**")
+            card.append(
+                f"\n**Actions:** 🔄 RT / 💬 Quote — {' | '.join(action_parts)}\n"
+                f"_(set action in `pending_actions.json`)_"
+            )
+        else:
+            card.append(
+                f"\n**Actions:** 🔄 RT  |  💬 Quote  |  ⏭️ Skip\n"
+                f"_(set action in `pending_actions.json`)_"
+            )
         messages.append({"content": "\n".join(card)})
 
     # ── Message 6: Content Ideas ──────────────────────────────────────────
@@ -406,59 +474,69 @@ def post_to_discord(channel_id: str, bot_token: str, messages: list[dict]) -> No
 # Pending Actions
 # ─────────────────────────────────────────────
 
-def write_pending_actions(
-    top_3: list[dict],
-    output_path: str,
-    account_id: str = "personal",
-    account_label: str = "@cosmicquantum (personal)",
-) -> None:
+def write_pending_actions(items: list[dict], output_path: str) -> None:
     """
-    Write top-3 tweets to pending_actions.json for the X Action Executor.
-    Status starts as 'pending' — human reviews and sets 'retweet'|'quote'|'skip'.
-    account_id + account_label tell the executor which X account to act from.
+    Write queue items to pending_actions.json for the X Action Executor.
+    Merges with existing entries, deduplicating by (tweet_id, account_id) while preserving review state.
     """
-    now = datetime.now(timezone.utc).isoformat()
-    actions = []
-    for tweet in top_3:
-        actions.append({
-            "tweet_id": tweet.get("id", ""),
-            "tweet_url": tweet.get("url", ""),
-            "tweet_text": tweet.get("text", "")[:280],
-            "author": _username(tweet),
-            "score": tweet.get("_score", 0),
-            "action": "pending",       # human sets: retweet | quote | skip
-            "account_id": account_id,
-            "account_label": account_label,
-            "timestamp": now,
-        })
+    path = Path(output_path).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).parent / path
 
-    path = Path(output_path)
-    # Merge with existing — only add tweets not already pending
-    existing: list[dict] = []
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except Exception:
-            existing = []
+    lock_handle = acquire_queue_lock(path)
+    try:
+        existing: list[dict] = []
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except Exception:
+                existing = []
 
-    existing_ids = {a["tweet_id"] for a in existing}
-    new_actions = [a for a in actions if a["tweet_id"] not in existing_ids]
-    merged = existing + new_actions
+        existing_map = {(a.get("tweet_id", ""), a.get("account_id", "")): a for a in existing}
+        merged: list[dict] = []
+        refreshed = 0
+        new_count = 0
 
-    path.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
-    print(f"[pending_actions] Written {len(new_actions)} new entries → {path}", file=sys.stderr)
+        for item in items:
+            key = (item.get("tweet_id", ""), item.get("account_id", ""))
+            prior = existing_map.pop(key, None)
+            if prior is None:
+                merged.append(item)
+                new_count += 1
+                continue
+
+            preserved = {
+                key_name: prior[key_name]
+                for key_name in (
+                    "action", "status", "quote_text", "approved_at", "reviewed_at", "review_notes",
+                    "execution_started_at", "executed_at", "failed_at", "error"
+                )
+                if key_name in prior
+            }
+            merged.append({**item, **preserved})
+            refreshed += 1
+
+        merged.extend(existing_map.values())
+        atomic_write_json(path, merged)
+        print(f"[pending_actions] Written {new_count} new entries, refreshed {refreshed}, total {len(merged)} → {path}", file=sys.stderr)
+    finally:
+        lock_handle.close()
 
 
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 
-def run(dry_run: bool = False) -> dict[str, Any]:
+def run(dry_run: bool = False, skip_llm: bool = False) -> dict[str, Any]:
     cfg = load_config()
 
-    # Resolve active X account (multi-account-ready)
-    account_id, account_label = _get_active_account(cfg)
-    print(f"[analyze] Active account: {account_label} (id={account_id})", file=sys.stderr)
+    # Load all configured X accounts
+    accounts = get_accounts(cfg)
+    if not accounts:
+        print("[warn] No x_accounts configured in config.json", file=sys.stderr)
+    else:
+        labels = ", ".join(a.get("label", a["id"]) for a in accounts)
+        print(f"[analyze] Accounts: {labels}", file=sys.stderr)
 
     # Load tweets window
     window_path = Path(cfg["x_monitor_window_path"])
@@ -483,26 +561,31 @@ def run(dry_run: bool = False) -> dict[str, Any]:
     print(f"[analyze] Top {len(top_10)} tweets selected", file=sys.stderr)
 
     # LLM: only top-3 get deep-dive (cost-efficient — not all 10)
-    cerebras_key = _get_cerebras_key()
-    if not cerebras_key:
-        raise RuntimeError("CEREBRAS_API_KEY not set (env or openclaw.json)")
-
-    client = OpenAI(
-        base_url="https://api.cerebras.ai/v1",
-        api_key=cerebras_key,
-    )
     top_for_deep = top_10[:top_deep]
+    skip_llm = skip_llm or os.environ.get("X_ENGAGE_SKIP_LLM", "").lower() in {"1", "true", "yes"}
+    if skip_llm:
+        print("[llm] Skipping remote LLM calls, using dry-run fallback analysis", file=sys.stderr)
+        analyses = build_fallback_analyses(top_for_deep)
+        content_ideas = build_fallback_content_ideas(top_10)
+    else:
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise RuntimeError("OPENAI_API_KEY not set in environment")
 
-    analyses: list[dict] = []
-    for i, tweet in enumerate(top_for_deep, 1):
-        uname = _username(tweet)
-        print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score', 0):.1f})", file=sys.stderr)
-        analysis = analyse_tweet_with_llm(client, tweet, model)
-        analyses.append(analysis)
+        from openai import OpenAI
 
-    # Generate 3 content ideas from detected top-performer patterns
-    print("[llm] Generating content ideas…", file=sys.stderr)
-    content_ideas = generate_content_ideas(client, top_10, analyses, model)
+        client = OpenAI(api_key=openai_key)
+
+        analyses: list[dict] = []
+        for i, tweet in enumerate(top_for_deep, 1):
+            uname = _username(tweet)
+            print(f"[llm] Analysing tweet #{i} by @{uname} (score={tweet.get('_score', 0):.1f})", file=sys.stderr)
+            analysis = analyse_tweet_with_llm(client, tweet, model)
+            analyses.append(analysis)
+
+        # Generate 3 content ideas from detected top-performer patterns
+        print("[llm] Generating content ideas…", file=sys.stderr)
+        content_ideas = generate_content_ideas(client, top_10, analyses, model)
 
     # Build result payload
     result: dict[str, Any] = {
@@ -526,9 +609,10 @@ def run(dry_run: bool = False) -> dict[str, Any]:
         ],
         "analyses": analyses,
         "content_ideas": content_ideas,
-        "active_account": {"id": account_id, "label": account_label},
+        "accounts": [{"id": a["id"], "label": a.get("label", a["id"])} for a in accounts],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tweet_count_in_window": len(tweets),
+        "llm_mode": "fallback" if skip_llm else "live",
     }
 
     if dry_run:
@@ -536,14 +620,10 @@ def run(dry_run: bool = False) -> dict[str, Any]:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return result
 
-    # Write pending actions for human review
+    # Write pending actions for human review — one item per tweet × account
     pending_path = cfg.get("pending_actions_path", "pending_actions.json")
-    write_pending_actions(
-        top_for_deep,
-        pending_path,
-        account_id=account_id,
-        account_label=account_label,
-    )
+    queue_items = build_queue_items(top_for_deep, accounts)
+    write_pending_actions(queue_items, pending_path)
 
     # Post digest to Discord
     bot_token = _get_discord_token()
@@ -555,7 +635,7 @@ def run(dry_run: bool = False) -> dict[str, Any]:
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     discord_msgs = build_discord_messages(
-        top_10, analyses, content_ideas, now_str, account_label=account_label
+        top_10, analyses, content_ideas, now_str, accounts=accounts
     )
     post_to_discord(channel_id, bot_token, discord_msgs)
     print(f"[done] Engagement report posted to Discord #{channel_id}", file=sys.stderr)
@@ -570,10 +650,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Print analysis JSON to stdout, skip Discord post and pending_actions write",
     )
+    parser.add_argument(
+        "--skip-llm",
+        action="store_true",
+        help="Use local fallback analysis/content ideas instead of remote LLM calls",
+    )
     args = parser.parse_args()
 
     try:
-        run(dry_run=args.dry_run)
+        run(dry_run=args.dry_run, skip_llm=args.skip_llm)
         sys.exit(0)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
