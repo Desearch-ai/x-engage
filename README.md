@@ -73,6 +73,53 @@ Do not bundle analysis and live execution into one unattended cron.
 
 ---
 
+## Rerun Safety (Posted-Ledger & Send-Window)
+
+### Posted-tweet dedup ledger
+
+`run_validation_wave.py` maintains a durable file **`posted_ledger.json`** next to the batch file.
+
+- Every item successfully posted (status `posted`) is recorded in the ledger under the key `<batch_id>:<order>`.
+- On rerun, items already in the ledger are **skipped with status `skipped_duplicate`** — they are never re-attempted.
+- Items that returned `window_blocked` or `failed` are **not** added to the ledger, so they will be retried on the next run.
+- Dry runs (`--dry-run`) never write to the ledger.
+
+**Rerun example:**
+
+```
+=== Validation Wave 1 ===
+Mode: LIVE
+Ledger entries: 2 already posted
+...
+[1/4] Posting as @cosmicquantum (personal)...
+  SKIPPED — already posted (ledger key: validation-wave-1:1)
+[2/4] Posting as @cosmicquantum (personal)...
+  SKIPPED — already posted (ledger key: validation-wave-1:2)
+[3/4] Posting as @desearch_ai (brand)...
+  Send-window check: within window (Wed 09:30 Tbilisi)
+  ...
+```
+
+### Send-window enforcement
+
+Each batch item carries a `send_window` field (e.g. `"Tue-Thu morning Tbilisi"`).
+
+`post_tweet.py` enforces this window **before any real browser action**:
+
+| Window result | `post_tweet` status | Added to ledger? |
+|---|---|---|
+| Within window | `posted` (or `failed`) | Yes (if posted) |
+| Outside window | `window_blocked` | No — will retry |
+| `dry_run=True` | `dry_run` | No |
+
+Window format: `<DayStart>-<DayEnd> <morning|afternoon> <Timezone>`
+- `morning` = 08:00–12:00 local time
+- `afternoon` = 12:00–18:00 local time
+- Day ranges that cross Sunday (e.g. `Sat-Mon`) are handled correctly.
+- Unparseable or unknown timezone strings are treated as **open** (post allowed) and logged.
+
+---
+
 ## Usage
 
 ### Engagement Analyzer (`analyze.py`)
