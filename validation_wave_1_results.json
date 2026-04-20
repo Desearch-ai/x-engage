@@ -1,0 +1,50 @@
+[
+  {
+    "account_id": "personal",
+    "text": "Spent 4 hours debugging a vector index issue. Root cause: wrong distance metric. The fix took 15 min. Lesson: always verify your similarity function before optimizing anything. Thread below on how to pick the right one for your data.",
+    "status": "dry_run",
+    "posted_url": null,
+    "external_post_id": null,
+    "error": null,
+    "timestamp": "2026-04-13T20:45:56.330743+00:00",
+    "order": 1,
+    "handle": "@cosmicquantum",
+    "pillar": "founder_pov"
+  },
+  {
+    "account_id": "personal",
+    "text": "Watching the subnet validation landscape shift. Key insight: it's no longer about who has the most stake \u2014 it's about who provides the most useful compute. Quality over quantity. Thread incoming.",
+    "status": "dry_run",
+    "posted_url": null,
+    "external_post_id": null,
+    "error": null,
+    "timestamp": "2026-04-13T20:45:56.331424+00:00",
+    "order": 2,
+    "handle": "@cosmicquantum",
+    "pillar": "ecosystem_commentary"
+  },
+  {
+    "account_id": "brand",
+    "text": "New: Streaming search responses. Get results as they're found \u2014 not after the full index scans. Perfect for long-tail queries. Enable with `stream: true` in your API call. Docs \u2192 https://docs.desearch.ai/streaming",
+    "status": "dry_run",
+    "posted_url": null,
+    "external_post_id": null,
+    "error": null,
+    "timestamp": "2026-04-13T20:45:56.331563+00:00",
+    "order": 3,
+    "handle": "@desearch_ai",
+    "pillar": "feature_announcement"
+  },
+  {
+    "account_id": "personal",
+    "text": "The compute token economics on Bittensor are getting interesting. Validator rewards shifting toward useful work verification \u2014 not just stake weight. This is the direction the network needed. Bullish.",
+    "status": "dry_run",
+    "posted_url": null,
+    "external_post_id": null,
+    "error": null,
+    "timestamp": "2026-04-13T20:45:56.331680+00:00",
+    "order": 4,
+    "handle": "@cosmicquantum",
+    "pillar": "ecosystem_commentary"
+  }
+]
