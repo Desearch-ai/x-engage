@@ -15,7 +15,7 @@ SAMPLE_CONFIG = {
     "x_accounts": [
         {
             "id": "personal",
-            "label": "@cosmicquantum (personal)",
+            "label": "@cosmic_desearch (founder)",
             "lane": "founder",
             "browser_profile": "~/.x-engage-browser/personal",
             "min_confidence": 0.7,
