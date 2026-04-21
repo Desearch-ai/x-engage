@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
 x-engage: X Action Executor
-Reads pending_actions.json, finds items with status=approved, and executes
+
+Reads pending_actions.json, finds items with status=approved AND explicit
+MC approval (approval_status='approved' + approval_url), and executes
 the requested action (retweet / quote tweet) via Playwright on x.com.
+
+APPROVAL CONTRACT:
+- Live execution REQUIRES explicit per-post approval from Mission Control
+- Required fields:
+  - status: "approved"
+  - approval_status: "approved" (explicit, not implied)
+  - approval_url: URL of approval (provenance for audit)
+- Posts lacking approval_status='approved' are rejected at the door
 
 Schema expected in pending_actions.json:
 {
@@ -13,8 +23,11 @@ Schema expected in pending_actions.json:
   "action":     "retweet" | "quote",
   "quote_text": "...",          # required for action=quote
   "status":     "pending" | "approved" | "done" | "skipped" | "failed",
+  "approval_status": "approved",   # REQUIRED for live execution
+  "approval_url": "...",            # REQUIRED for live execution
+  "approved_by": "...",             # recommended for audit
   "timestamp":  "2024-...",
-  "executed_at": "..."          # set by this script after execution
+  "executed_at": "..."              # set by this script after execution
 }
 
 Usage:
@@ -75,6 +88,40 @@ SEL_RETWEET_CONFIRM = '[data-testid="retweetConfirm"]'  # "Repost" button in pop
 SEL_QUOTE_OPTION    = '[data-testid="quoteTweet"]'      # "Quote" option in the retweet popup
 SEL_TWEET_TEXTAREA  = '[data-testid="tweetTextarea_0"]' # compose box after clicking Quote
 SEL_TWEET_SUBMIT    = '[data-testid="tweetButtonInline"]'  # "Post" submit button
+
+# ─────────────────────────────────────────────
+# Approval validation
+# ─────────────────────────────────────────────
+
+def validate_action_approval(item: dict) -> tuple[bool, str]:
+    """
+    Validate that an action item has explicit Mission Control approval.
+    
+    Required for LIVE execution:
+    - approval_status must be "approved" (exact string match)
+    - approval_url must be present (provenance link)
+    - approved_by is recommended but optional
+    
+    Returns (is_valid, reason_string).
+    """
+    approval_status = item.get("approval_status", "").strip().lower() if item.get("approval_status") else ""
+    approval_url = item.get("approval_url", "").strip()
+    approved_by = item.get("approved_by", "").strip()
+    
+    if not approval_status:
+        return False, "missing approval_status - live execution requires explicit MC per-post approval"
+    
+    if approval_status != "approved":
+        return False, f"approval_status is '{approval_status}', not 'approved' - live execution blocked"
+    
+    if not approval_url:
+        return False, "missing approval_url - cannot verify approval provenance for audit"
+    
+    if not approved_by:
+        print(f"  [warn] approved_by not set - audit trail will be incomplete", file=sys.stderr)
+    
+    return True, f"approved by {approved_by or 'unknown'} (URL: {approval_url})"
+
 
 # ─────────────────────────────────────────────
 # Account helpers
@@ -166,7 +213,13 @@ def save_actions(actions: list[dict]) -> None:
 
 
 def get_approved(actions: list[dict]) -> list[dict]:
-    """Return items that are approved and have a valid action type."""
+    """
+    Return items that are approved and have a valid action type.
+    
+    NOTE: This only filters by status='approved' and valid action types.
+    Full approval validation (approval_status + approval_url) is done
+    at execution time via validate_action_approval().
+    """
     return [
         a for a in actions
         if a.get("status") == "approved" and a.get("action") in ("retweet", "quote")
@@ -218,6 +271,9 @@ def post_confirmation(bot_token: str, item: dict, success: bool, error_msg: str 
             f"🔗 <{tweet_url}>",
             f"🕐 {now_str}",
         ]
+        # Include approval provenance for audit
+        if item.get("approval_url"):
+            lines.append(f"📋 Approval: {item['approval_url']}")
     else:
         lines = [
             f"❌ **{action_type.capitalize()} FAILED** for @{author}",
@@ -226,6 +282,8 @@ def post_confirmation(bot_token: str, item: dict, success: bool, error_msg: str 
             f"⚠️ `{error_msg[:200]}`",
             f"🕐 {now_str}",
         ]
+        if item.get("approval_url"):
+            lines.append(f"📋 Approval: {item['approval_url']}")
 
     _discord_post(bot_token, "\n".join(lines))
 
@@ -319,6 +377,9 @@ async def run_executor(dry_run: bool = False) -> int:
     Returns exit code: 0 = success (or nothing to do), 1 = one or more failures.
     Groups approved actions by account_id and opens a separate browser context
     per account using its configured profile directory.
+    
+    CRITICAL: Validates explicit MC approval (approval_status='approved' + approval_url)
+    before any live execution. Items without valid approval are rejected at the door.
     """
     try:
         from analyze import load_config
@@ -335,19 +396,55 @@ async def run_executor(dry_run: bool = False) -> int:
             print("[executor] No approved actions found in pending_actions.json.")
             return 0
 
-        print(f"[executor] Found {len(approved)} approved action(s):")
+        # Filter out items without explicit MC approval (for both dry-run and live)
+        # In dry-run mode, we show what would be rejected; in live mode, we reject
+        explicitly_approved = []
+        rejected_for_approval = []
+        
+        for a in approved:
+            is_valid, reason = validate_action_approval(a)
+            if is_valid:
+                explicitly_approved.append(a)
+            else:
+                rejected_for_approval.append((a, reason))
+
+        print(f"[executor] Found {len(approved)} approved action(s) total:")
         for a in approved:
             acct = a.get("account_id", "?")
             print(f"  • [{a['action'].upper()}] @{a.get('author','?')} ({acct}) — {a['tweet_url']}")
 
+        if rejected_for_approval:
+            print(f"\n[executor] ⚠️ {len(rejected_for_approval)} item(s) rejected (no explicit MC approval):")
+            for a, reason in rejected_for_approval:
+                print(f"  ❌ @{a.get('author','?')} ({a.get('account_id','?')}): {reason}")
+
+        if not explicitly_approved:
+            print("\n[executor] No items with valid explicit MC approval. Exiting.")
+            if not dry_run:
+                # Mark rejected items in the queue
+                for a, reason in rejected_for_approval:
+                    a["status"] = "approval_rejected"
+                    a["error"] = reason
+                    a["rejected_at"] = datetime.now(timezone.utc).isoformat()
+                save_actions(actions)
+            return 0 if dry_run else 1
+
+        print(f"\n[executor] ✓ {len(explicitly_approved)} item(s) with valid explicit MC approval:")
+        for a in explicitly_approved:
+            acct = a.get("account_id", "?")
+            approval_url = a.get("approval_url", "")
+            print(f"  ✅ [{a['action'].upper()}] @{a.get('author','?')} ({acct})")
+            print(f"      Approval: {approval_url[:60]}..." if len(approval_url) > 60 else f"      Approval: {approval_url}")
+
         if dry_run:
             print("\n[dry-run] Actions that would be executed:")
-            for a in approved:
+            for a in explicitly_approved:
                 acct = a.get("account_id", "?")
                 print(f"  → {a['action'].upper()} tweet {a['tweet_id']} by @{a.get('author','?')} as {acct}")
                 if a["action"] == "quote":
                     qt = a.get("quote_text", "")
                     print(f"     quote_text: {qt[:120]}{'…' if len(qt) > 120 else ''}")
+                print(f"     approval_url: {a.get('approval_url', 'NONE')}")
             print("[dry-run] Done (no browser launched).")
             return 0
 
@@ -362,6 +459,10 @@ async def run_executor(dry_run: bool = False) -> int:
         account_groups: dict[str, list[dict]] = {}
         for item in actions:
             if item.get("status") != "approved" or item.get("action") not in ("retweet", "quote"):
+                continue
+            # Only include items with valid explicit approval
+            is_valid, _ = validate_action_approval(item)
+            if not is_valid:
                 continue
             acct_id = item.get("account_id", "default")
             account_groups.setdefault(acct_id, []).append(item)
@@ -405,6 +506,7 @@ async def run_executor(dry_run: bool = False) -> int:
                     author = item.get("author", "?")
 
                     print(f"\n[executor] ── Processing: {action_type.upper()} @{author} ({tweet_id}) as '{acct_id}' ──")
+                    print(f"  Approval: {item.get('approval_url', 'NONE')}")
 
                     success = False
                     error_msg = ""
@@ -445,10 +547,18 @@ async def run_executor(dry_run: bool = False) -> int:
 
                 await context.close()
 
-        total = len(approved)
+        # Handle rejected items in the queue
+        for a, reason in rejected_for_approval:
+            a["status"] = "approval_rejected"
+            a["error"] = reason
+            a["rejected_at"] = datetime.now(timezone.utc).isoformat()
+        save_actions(actions)
+
+        total = len(explicitly_approved)
         done = sum(1 for a in actions if a.get("status") == "done")
         failed = sum(1 for a in actions if a.get("status") == "failed")
-        print(f"\n[executor] Summary: {done} done, {failed} failed out of {total} approved actions.")
+        rejected = len(rejected_for_approval)
+        print(f"\n[executor] Summary: {done} done, {failed} failed, {rejected} rejected (no approval) out of {len(approved)} total approved actions.")
         return 1 if any_failed else 0
     finally:
         lock_handle.close()

@@ -3,7 +3,41 @@
 Two-part system for Desearch AI's X/Twitter engagement workflow:
 
 1. **`analyze.py`** — Reads x-monitor's sliding tweet window, scores posts, runs GPT-4o-mini deep-dive on top performers, generates @desearch_ai content ideas, and posts a digest to Discord **#x-alerts**.
-2. **`execute_actions.py`** — Reads `pending_actions.json`, finds items Giga approved, and executes `retweet` / `quote` actions via Playwright browser automation on x.com.
+2. **`execute_actions.py`** — Reads `pending_actions.json`, finds items with **explicit Mission Control approval**, and executes `retweet` / `quote` actions via Playwright browser automation on x.com.
+3. **`post_tweet.py`** — Posts original tweets with the same approval contract.
+
+---
+
+## 🔒 Explicit Per-Post Approval Requirement
+
+**Live execution requires explicit Mission Control per-post approval.** The system no longer accepts implied, batch, or chat-based approval for publishing.
+
+### Approval Contract
+
+For any live action (retweet, quote, or original post), the item MUST include:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `approval_status` | ✅ Yes | Must be exactly `"approved"` (case-insensitive) |
+| `approval_url` | ✅ Yes | URL to the MC approval message/link (audit trail) |
+| `approved_by` | Recommended | Who approved (for audit completeness) |
+
+### Approval Validation Flow
+
+```
+Item enters queue → Check approval_status='approved' + approval_url exists
+                                    ↓
+                    ❌ REJECTED         ✅ PROCEED
+                    (status =              ↓
+                     approval_rejected)      Execute action
+```
+
+Items without valid approval are:
+- Logged with rejection reason
+- Marked as `approval_rejected` in the queue
+- Never attempted for live execution
+
+This ensures auditability — every live action can be traced back to an explicit human approval.
 
 ---
 
@@ -16,9 +50,9 @@ Two-part system for Desearch AI's X/Twitter engagement workflow:
 5. Generates 3 content ideas for @desearch_ai based on the patterns.
 6. Posts a 6-message digest to **Discord `#x-alerts` (channel `1477727527618347340`)**.
 7. Writes `pending_actions.json` with the top 3 tweets for RT/Quote approval, using an exclusive queue lock and atomic replace semantics.
-8. Live execution remains a separate step, behind manual approval and an explicit env gate.
+8. Live execution remains a separate step, behind **explicit per-post approval** from Mission Control.
 
-**After merging → analysis reports appear in Discord automatically. Live X account actions still require approval first.**
+**After merging → analysis reports appear in Discord automatically. Live X account actions still require explicit MC approval first.**
 
 ---
 
@@ -35,7 +69,7 @@ Two-part system for Desearch AI's X/Twitter engagement workflow:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 Top 3 Deep Dive
 [Detailed card per post: tweet text + engagement breakdown + LLM analysis]
-[Actions: 🔄 RT as @cosmicquantum | 💬 Quote | ⏭️ Skip]
+[Actions: 🔄 RT as @cosmic_desearch | 💬 Quote | ⏭️ Skip]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 💡 Content Ideas for @desearch_ai
 [3 ideas based on top-performer patterns]
@@ -52,13 +86,13 @@ cp .env.example .env
 # Fill in OPENAI_API_KEY and DISCORD_BOT_TOKEN in .env
 uv sync
 
-# Install Playwright's Chromium browser (required for execute_actions.py)
+# Install Playwright's Chromium browser (required for execute_actions.py and post_tweet.py)
 uv run playwright install chromium
 ```
 
 ### First-time X.com login
 
-`execute_actions.py` uses **per-account persistent browser profiles** defined in `config.json` (`browser_profile` field per account, e.g. `~/.x-engage-browser/personal` and `~/.x-engage-browser/brand`).
+`execute_actions.py` and `post_tweet.py` use **per-account persistent browser profiles** defined in `config.json` (`browser_profile` field per account, e.g. `~/.x-engage-browser/personal` and `~/.x-engage-browser/brand`).
 On the very first run for each account the browser will open to `x.com`. Log in to the correct account manually — the session is saved for all future runs.
 
 ### Runtime cadence
@@ -66,6 +100,7 @@ On the very first run for each account the browser will open to `x.com`. Log in 
 Recommended cadence:
 - every 4h: `bash run-engage.sh analyze`
 - operator review window after each digest
+- explicit approval via Mission Control SocialPage
 - optional/manual validation: `bash run-engage.sh execute-dry-run`
 - live execution only when explicitly approved: `X_ENGAGE_ENABLE_LIVE_EXECUTION=1 bash run-engage.sh execute-live`
 
@@ -96,8 +131,21 @@ X_ENGAGE_ENABLE_LIVE_EXECUTION=1 bash run-engage.sh execute-live
 # Dry run — see what would be executed without opening any browser
 uv run python execute_actions.py --dry-run
 
-# Live run — open Chromium, perform approved actions, post Discord confirmations
+# Live run — requires explicit MC approval for each item
 uv run python execute_actions.py
+```
+
+### Original Tweet Poster (`post_tweet.py`)
+
+```bash
+# Dry run
+uv run python post_tweet.py --account personal --text "Hello world" --dry-run
+
+# Live — requires explicit approval via CLI args or item metadata
+uv run python post_tweet.py --account personal --text "Hello world" \
+  --approval-status approved \
+  --approval-url "https://discord.com/channels/.../1234567890" \
+  --approved-by "Giga"
 ```
 
 ---
@@ -108,6 +156,8 @@ uv run python execute_actions.py
 |------|---------|
 | `analyze.py` | Engagement analyzer: score, analyze, post digest to Discord |
 | `execute_actions.py` | Action executor: RT/Quote approved tweets via Playwright |
+| `post_tweet.py` | Post original tweets with explicit MC approval |
+| `run_validation_wave.py` | Validation batch executor (requires approval in batch file) |
 | `run-engage.sh` | Shell wrapper for cron (loads .env, calls python3 analyze.py) |
 | `config.json` | Settings (paths, model, scoring weights, accounts) |
 | `.env` | API keys (not in git) |
@@ -134,27 +184,30 @@ Each entry represents one **tweet × account** pair. The same tweet appears once
 
 ```json
 [{
-  "tweet_id":     "123",
-  "tweet_url":    "https://x.com/user/status/123",
-  "tweet_text":   "...",
-  "author":       "username",
-  "score":        650.0,
-  "action":       "pending | retweet | quote",
-  "quote_text":   "(required for action=quote)",
-  "status":       "pending | approved | done | skipped | failed",
-  "account_id":   "personal",
-  "account_label":"@cosmicquantum (personal)",
-  "lane":         "founder | brand",
-  "action_types": ["retweet", "quote"],
-  "source":       "x-engage-analyzer",
-  "category":     "ai",
-  "timestamp":    "2026-..."
+  "tweet_id":       "123",
+  "tweet_url":      "https://x.com/user/status/123",
+  "tweet_text":     "...",
+  "author":         "username",
+  "score":          650.0,
+  "action":         "pending | retweet | quote",
+  "quote_text":     "(required for action=quote)",
+  "status":         "pending | approved | done | skipped | failed | approval_rejected",
+  "account_id":     "personal",
+  "account_handle": "cosmic_desearch",
+  "lane":           "founder | brand",
+  "action_types":   ["retweet", "quote"],
+  "source":         "x-engage-analyzer",
+  "category":       "ai",
+  "timestamp":      "2026-...",
+  "approval_status": "approved",        // REQUIRED for live execution
+  "approval_url":    "https://discord.com/...",  // REQUIRED for live execution
+  "approved_by":     "Giga"             // recommended for audit
 }]
 ```
 
 Deduplication key is `(tweet_id, account_id)` — re-running `analyze.py` never adds duplicates.
 
-Set `action=retweet` or `action=quote` + `status=approved` to queue for execution.
+Set `action=retweet` or `action=quote` + `status=approved` + `approval_status=approved` + `approval_url=<MC approval URL>` to queue for execution.
 After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `error` field).
 
 ---
@@ -174,7 +227,8 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
   "x_accounts": [
     {
       "id": "personal",
-      "label": "@cosmicquantum (personal)",
+      "label": "@cosmic_desearch (founder)",
+      "handle": "cosmic_desearch",
       "lane": "founder",
       "browser_profile": "~/.x-engage-browser/personal",
       "min_confidence": 0.7,
@@ -183,6 +237,7 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
     {
       "id": "brand",
       "label": "@desearch_ai (brand)",
+      "handle": "desearch_ai",
       "lane": "brand",
       "browser_profile": "~/.x-engage-browser/brand",
       "min_confidence": 0.8,
@@ -198,9 +253,9 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
 
 `analyze.py` generates one `pending_actions.json` entry **per tweet × account**. All accounts in `x_accounts` are processed — there is no `active_account` toggle.
 
-`execute_actions.py` groups approved actions by `account_id` and opens a **separate Chromium browser context** per account (each with its own `browser_profile`), so sessions never cross-contaminate. It now claims the shared queue lock before execution and marks each item as `executing` before a live browser action, so crashes remain visible instead of silently re-running the same approval.
+`execute_actions.py` groups approved actions by `account_id` and opens a **separate Chromium browser context** per account (each with its own `browser_profile`), so sessions never cross-contaminate. It now claims the shared queue lock before execution and validates explicit MC approval before any live action.
 
-To add a new account: append an entry to `x_accounts` with its own `id`, `lane`, `browser_profile`, and `action_types`. No code changes required.
+To add a new account: append an entry to `x_accounts` with its own `id`, `handle`, `lane`, `browser_profile`, and `action_types`. No code changes required.
 
 ---
 
@@ -217,8 +272,8 @@ monitor.py                →    analyze.py
     Discord #x-alerts            ↓ posts digest to Discord #x-alerts
                                  ↓ writes pending_actions.json
                                         ↓
-                               execute_actions.py (manual trigger)
-                                 ↓ reads approved items
+                               execute_actions.py (manual trigger, requires MC approval)
+                                 ↓ reads approved items with approval_status='approved'
                                  ↓ RT/Quote via Playwright
                                  ↓ posts confirmations to Discord
 ```
