@@ -18,15 +18,15 @@ Usage:
 import asyncio
 import argparse
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from runtime_loader import load_config
+
 SCRIPT_DIR = Path(__file__).parent
-CONFIG_FILE = SCRIPT_DIR / "config.json"
 
 # X.com selectors
 SEL_COMPOSE = '[data-testid="tweetTextarea_0"]'
@@ -39,17 +39,62 @@ _TZ_MAP = {"Tbilisi": "Asia/Tbilisi"}
 _PERIOD_HOURS = {"morning": (8, 12), "afternoon": (12, 18)}
 
 
-def is_within_send_window(send_window: str, now: datetime | None = None) -> tuple[bool, str]:
-    """
-    Check whether `now` falls inside the human-readable send_window string.
+def _parse_hhmm(value: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"(\d{2}):(\d{2})", value.strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
 
-    Format: "<DayStart>-<DayEnd> <morning|afternoon> <TZ>"
-    Example: "Tue-Thu morning Tbilisi"
 
-    Returns (allowed, reason_string).
-    Unparseable windows are treated as open (allowed=True) so unknown formats
-    never silently block posts; operators should review the format instead.
+def _is_within_structured_send_window(send_window: dict, now: datetime | None = None) -> tuple[bool, str]:
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    start = _parse_hhmm(str(send_window.get("start", "")))
+    end = _parse_hhmm(str(send_window.get("end", "")))
+    tz_name = str(send_window.get("tz", "UTC")).strip() or "UTC"
+    if not start or not end:
+        return True, f"unparseable send window {send_window!r} — allowing by default"
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return True, f"unknown timezone '{tz_name}' — allowing by default"
+
+    local_now = now.astimezone(tz)
+    current_minute = local_now.hour * 60 + local_now.minute
+    start_minute = start[0] * 60 + start[1]
+    end_minute = end[0] * 60 + end[1]
+
+    if start_minute < end_minute:
+        allowed = start_minute <= current_minute < end_minute
+    else:
+        allowed = current_minute >= start_minute or current_minute < end_minute
+
+    if not allowed:
+        return (
+            False,
+            f"outside send window ({start[0]:02d}:{start[1]:02d}–{end[0]:02d}:{end[1]:02d} {tz_name}); "
+            f"current time: {local_now.strftime('%H:%M')}",
+        )
+
+    return True, f"within window ({local_now.strftime('%a %H:%M')} {tz_name})"
+
+
+def is_within_send_window(send_window: str | dict, now: datetime | None = None) -> tuple[bool, str]:
     """
+    Check whether `now` falls inside a send-window.
+
+    Supports both:
+    - managed runtime shape: {"start": "08:00", "end": "22:00", "tz": "Asia/Tbilisi"}
+    - legacy human string: "Tue-Thu morning Tbilisi"
+    """
+    if isinstance(send_window, dict):
+        return _is_within_structured_send_window(send_window, now=now)
+
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -73,7 +118,6 @@ def is_within_send_window(send_window: str, now: datetime | None = None) -> tupl
     if start_day is None or end_day is None:
         return True, f"unknown day names '{day_start_str}'/'{day_end_str}' — allowing by default"
 
-    # Handle week-wrap ranges like Sat-Mon (Sat=5, Mon=0)
     if start_day <= end_day:
         day_ok = start_day <= cur_day <= end_day
     else:
@@ -102,36 +146,31 @@ def is_within_send_window(send_window: str, now: datetime | None = None) -> tupl
     return True, f"within window ({day_label} {time_label} {tz_name})"
 
 
-def load_config():
-    if CONFIG_FILE.exists():
-        return json.loads(CONFIG_FILE.read_text())
-    return {}
+def resolve_send_window(send_window: str | dict | None) -> str | dict | None:
+    if send_window is not None:
+        return send_window
+    cfg = load_config()
+    return cfg.get("send_window")
 
 
 def get_profile_path(account_id: str) -> Path:
-    """Get browser profile path for account - try multiple locations."""
+    """Get browser profile path for account, preferring the managed runtime contract."""
     cfg = load_config()
 
-    # Try x-engage config paths first
     for acct in cfg.get("x_accounts", []):
-        if acct.get("id") == account_id:
+        if acct.get("id") == account_id or acct.get("handle") == account_id:
             raw = acct.get("browser_profile", "")
             if raw:
-                path = Path(raw).expanduser().resolve()
-                if path.exists():
-                    return path
+                return Path(raw).expanduser().resolve()
 
-    # Primary: dedicated x-engage browser profiles
     xengage_path = Path.home() / ".x-engage-browser" / account_id
     if xengage_path.exists():
         return xengage_path
 
-    # Last resort: try Chrome default profile
     chrome_path = Path.home() / "Library/Application Support/Google/Chrome/Default"
     if chrome_path.exists():
         return chrome_path
 
-    # Create new
     xengage_path.mkdir(parents=True, exist_ok=True)
     return xengage_path
 
@@ -139,31 +178,30 @@ def get_profile_path(account_id: str) -> Path:
 def validate_approval(item: dict) -> tuple[bool, str]:
     """
     Validate that the post has explicit Mission Control approval.
-    
+
     Required for LIVE execution:
     - approval_status must be "approved" (exact string match)
     - approval_url must be present (provenance link)
     - approved_by should be present but is optional
-    
+
     Returns (is_valid, reason_string).
     """
     approval_status = (item.get("approval_status") or "").strip().lower()
     approval_url = (item.get("approval_url") or "").strip()
     approved_by = (item.get("approved_by") or "").strip()
-    
+
     if not approval_status:
         return False, "missing approval_status field - live execution requires explicit MC per-post approval"
-    
+
     if approval_status != "approved":
         return False, f"approval_status is '{approval_status}', not 'approved' - live execution blocked"
-    
+
     if not approval_url:
         return False, "missing approval_url - cannot verify approval provenance for audit"
-    
-    # approved_by is recommended but not strictly required
+
     if not approved_by:
-        print(f"  [warn] approved_by not set - audit trail will be incomplete", file=sys.stderr)
-    
+        print("  [warn] approved_by not set - audit trail will be incomplete", file=sys.stderr)
+
     return True, f"approved by {approved_by or 'unknown'} (URL: {approval_url})"
 
 
@@ -171,7 +209,7 @@ async def post_tweet(
     account_id: str,
     text: str,
     dry_run: bool = False,
-    send_window: str | None = None,
+    send_window: str | dict | None = None,
     approval_status: str | None = None,
     approval_url: str | None = None,
     approved_by: str | None = None,
@@ -182,21 +220,18 @@ async def post_tweet(
         account_id: Account identifier (e.g. 'personal', 'brand').
         text: Tweet text (truncated to 280 chars if longer).
         dry_run: If True, simulate without opening a browser.
-        send_window: Optional window spec like 'Tue-Thu morning Tbilisi'.
-            If provided and current time is outside the window, the post
-            is blocked with status='window_blocked' instead of failing.
+        send_window: Optional explicit override. If omitted, the managed Social OS
+            runtime contract is consulted before any fallback.
         approval_status: Explicit approval status from MC (required for live).
         approval_url: URL of approval (required for live).
         approved_by: Who approved (recommended for audit).
     """
-    # Build item for approval validation
     item = {
         "approval_status": approval_status,
         "approval_url": approval_url,
         "approved_by": approved_by,
     }
-    
-    # Validate approval for live execution
+
     if not dry_run:
         is_valid, reason = validate_approval(item)
         print(f"  Approval check: {reason}")
@@ -211,7 +246,7 @@ async def post_tweet(
                 "approved_by": approved_by,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-    
+
     profile_dir = get_profile_path(account_id)
 
     print(f"Using profile: {profile_dir}")
@@ -225,7 +260,6 @@ async def post_tweet(
         "external_post_id": None,
         "error": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        # Preserve approval provenance
         "approval_status": approval_status,
         "approval_url": approval_url,
         "approved_by": approved_by,
@@ -236,9 +270,9 @@ async def post_tweet(
         print(f"[dry-run] Would post: {text[:80]}...")
         return result
 
-    # Enforce send-window before any real publish attempt
-    if send_window:
-        allowed, reason = is_within_send_window(send_window)
+    effective_send_window = resolve_send_window(send_window)
+    if effective_send_window:
+        allowed, reason = is_within_send_window(effective_send_window)
         print(f"  Send-window check: {reason}")
         if not allowed:
             result["status"] = "window_blocked"
@@ -272,11 +306,9 @@ async def post_tweet(
         page = context.pages[0] if context.pages else await context.new_page()
 
         try:
-            # Navigate to home
             await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(3000)
 
-            # Check if logged in
             current_url = page.url.lower()
             if "login" in current_url or "signin" in current_url:
                 result["status"] = "failed"
@@ -287,34 +319,26 @@ async def post_tweet(
 
             print(f"Logged in, URL: {page.url}")
 
-            # Wait for compose area - try multiple selectors
             try:
                 await page.wait_for_selector(SEL_COMPOSE, timeout=15000)
-            except:
-                # Try clicking the compose button in the sidebar
+            except Exception:
                 await page.click('[data-testid="SideNav_NewTweet_Button"]')
                 await page.wait_for_timeout(2000)
                 await page.wait_for_selector(SEL_COMPOSE, timeout=10000)
 
-            # Fill the tweet
             await page.fill(SEL_COMPOSE, text)
             print(f"Filled tweet text: {text[:50]}...")
 
-            # Click post
             await page.click(SEL_POST)
             print("Clicked post button")
 
-            # Wait for post to submit
             await page.wait_for_timeout(5000)
 
-            # Try to extract the tweet ID from URL or page
-            # The URL typically changes to /i/status/{id} after posting
             final_url = page.url
             print(f"Final URL: {final_url}")
 
             if "/status/" in final_url:
                 result["posted_url"] = final_url
-                # Extract ID from URL
                 parts = final_url.split("/status/")
                 if len(parts) > 1:
                     result["external_post_id"] = parts[-1].split("?")[0]
@@ -326,11 +350,10 @@ async def post_tweet(
             result["status"] = "failed"
             result["error"] = str(e)
             print(f"Error posting: {e}")
-            # Take screenshot for debugging
             try:
                 await page.screenshot(path=f"/tmp/post_error_{account_id}.png")
                 result["screenshot"] = f"/tmp/post_error_{account_id}.png"
-            except:
+            except Exception:
                 pass
 
         await context.close()
@@ -350,9 +373,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = asyncio.run(post_tweet(
-        args.account, 
-        args.text, 
-        args.dry_run, 
+        args.account,
+        args.text,
+        args.dry_run,
         args.send_window,
         args.approval_status,
         args.approval_url,

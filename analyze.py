@@ -23,13 +23,14 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
+from runtime_loader import load_config as load_runtime_config
+
 # ─────────────────────────────────────────────
 # Config & Env
 # ─────────────────────────────────────────────
 
 load_dotenv()
 
-CONFIG_PATH = os.environ.get("X_ENGAGE_CONFIG", Path(__file__).parent / "config.json")
 PENDING_ACTIONS_LOCK_NAME = ".pending_actions.lock"
 
 
@@ -77,8 +78,7 @@ def _get_discord_token() -> str:
 
 
 def load_config() -> dict:
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    return load_runtime_config()
 
 
 def get_accounts(cfg: dict) -> list[dict]:
@@ -533,10 +533,10 @@ def run(dry_run: bool = False, skip_llm: bool = False) -> dict[str, Any]:
     # Load all configured X accounts
     accounts = get_accounts(cfg)
     if not accounts:
-        print("[warn] No x_accounts configured in config.json", file=sys.stderr)
+        print("[warn] No x_accounts configured from managed runtime or config fallback", file=sys.stderr)
     else:
         labels = ", ".join(a.get("label", a["id"]) for a in accounts)
-        print(f"[analyze] Accounts: {labels}", file=sys.stderr)
+        print(f"[analyze] Accounts ({cfg.get('runtime_source', 'config_fallback')}): {labels}", file=sys.stderr)
 
     # Load tweets window
     window_path = Path(cfg["x_monitor_window_path"])

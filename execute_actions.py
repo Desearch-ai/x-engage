@@ -46,6 +46,8 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+from runtime_loader import load_config
 try:
     from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 except ModuleNotFoundError:
@@ -69,7 +71,6 @@ DISCORD_CHANNEL_ID = "1477727527618347340"
 LOCK_FILE = SCRIPT_DIR / ".executor.lock"
 _LEGACY_LOCK_HANDLE = None
 
-_DEFAULT_BROWSER_PROFILE = Path.home() / ".x-engage-browser-profile" / "default"
 
 # Timeouts (ms)
 PAGE_LOAD_TIMEOUT = 30_000    # 30s to load a tweet page
@@ -127,18 +128,19 @@ def validate_action_approval(item: dict) -> tuple[bool, str]:
 # Account helpers
 # ─────────────────────────────────────────────
 
+def _default_browser_profile() -> Path:
+    root = Path(os.environ.get("X_ENGAGE_BROWSER_PROFILE_ROOT", Path.home() / ".x-engage-browser")).expanduser()
+    return (root / "default").resolve()
+
+
 def get_browser_profile(cfg: dict, account_id: str) -> Path:
-    """
-    Resolve the browser profile path for a given account_id.
-    Expands ~ and returns an absolute Path.
-    Falls back to _DEFAULT_BROWSER_PROFILE if account not found.
-    """
+    """Resolve the profile selected by the managed runtime contract for this account."""
     for acct in cfg.get("x_accounts", []):
-        if acct.get("id") == account_id:
+        if acct.get("id") == account_id or acct.get("handle") == account_id:
             raw = acct.get("browser_profile", "")
             if raw:
                 return Path(raw).expanduser().resolve()
-    return _DEFAULT_BROWSER_PROFILE
+    return _default_browser_profile()
 
 
 # ─────────────────────────────────────────────
@@ -382,7 +384,6 @@ async def run_executor(dry_run: bool = False) -> int:
     before any live execution. Items without valid approval are rejected at the door.
     """
     try:
-        from analyze import load_config
         cfg = load_config()
     except Exception:
         cfg = {}

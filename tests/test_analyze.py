@@ -8,6 +8,7 @@ from analyze import (
     get_accounts,
     build_queue_items,
     write_pending_actions,
+    load_config,
     _username,
 )
 
@@ -254,3 +255,63 @@ class TestWritePendingActions:
         account_ids = {d["account_id"] for d in data}
         assert "personal" in account_ids
         assert "brand" in account_ids
+
+
+# ── managed runtime contract ───────────────────────────────────────────────────
+
+class TestManagedRuntimeAccounts:
+    def test_prefers_managed_runtime_accounts_over_local_config(self, tmp_path, monkeypatch):
+        runtime_path = tmp_path / "runtime.json"
+        runtime_path.write_text(json.dumps({
+            "send_window_start": "08:00",
+            "send_window_end": "22:00",
+            "send_window_tz": "Asia/Tbilisi",
+            "lane_routing": {
+                "founder": ["cosmic_desearch"],
+                "brand": ["desearch_ai"],
+            },
+            "session_mappings": {
+                "cosmic_desearch": "founder-session",
+                "desearch_ai": "brand-session",
+            },
+            "engage_check_interval_seconds": 3600,
+        }))
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(SAMPLE_CONFIG))
+        monkeypatch.setenv("X_ENGAGE_RUNTIME_PATH", str(runtime_path))
+        monkeypatch.setenv("X_ENGAGE_CONFIG", str(config_path))
+        monkeypatch.setenv("X_ENGAGE_BROWSER_PROFILE_ROOT", str(tmp_path / "profiles"))
+
+        cfg = load_config()
+        accounts = get_accounts(cfg)
+
+        assert cfg["runtime_source"] == "managed_file"
+        assert [(a["id"], a["lane"]) for a in accounts] == [
+            ("personal", "founder"),
+            ("brand", "brand"),
+        ]
+        assert accounts[0]["browser_profile"].endswith("founder-session")
+        assert accounts[1]["browser_profile"].endswith("brand-session")
+
+    def test_managed_runtime_can_introduce_handle_without_local_fallback(self, tmp_path, monkeypatch):
+        runtime_path = tmp_path / "runtime.json"
+        runtime_path.write_text(json.dumps({
+            "lane_routing": {"research": ["new_handle"]},
+            "session_mappings": {"new_handle": "research-session"},
+            "send_window": {"start": "08:00", "end": "22:00", "tz": "UTC"},
+            "rate_limits": {"max_posts_per_day": 10, "max_replies_per_day": 20},
+            "check_interval_seconds": 3600,
+        }))
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(SAMPLE_CONFIG))
+        monkeypatch.setenv("X_ENGAGE_RUNTIME_PATH", str(runtime_path))
+        monkeypatch.setenv("X_ENGAGE_CONFIG", str(config_path))
+        monkeypatch.setenv("X_ENGAGE_BROWSER_PROFILE_ROOT", str(tmp_path / "profiles"))
+
+        accounts = get_accounts(load_config())
+
+        assert len(accounts) == 1
+        assert accounts[0]["id"] == "new_handle"
+        assert accounts[0]["handle"] == "new_handle"
+        assert accounts[0]["label"] == "@new_handle"
+        assert accounts[0]["lane"] == "research"

@@ -90,9 +90,30 @@ uv sync
 uv run playwright install chromium
 ```
 
+### Managed runtime contract (default path)
+
+`x-engage` now resolves its normal runtime behavior from the active `social_runtime_configs` row managed by Social OS.
+
+- **Accounts / lanes** come from `lane_routing`
+- **Browser profile mapping** comes from `session_mappings`
+- **Default post send-window** comes from `send_window`
+- **Execution cadence metadata** comes from `check_interval_seconds`
+
+Supported runtime sources, in order:
+
+1. `X_ENGAGE_RUNTIME_PATH=/path/to/runtime.json` — explicit local override for tests / emergency recovery
+2. `SOCIAL_OS_SUPABASE_URL` + `SOCIAL_OS_SUPABASE_KEY` (or `SOCIAL_OS_SUPABASE_ANON_KEY`)
+3. `SUPABASE_URL` + `SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY`
+4. `VITE_SUPABASE_URL` + `VITE_SUPABASE_ANON_KEY`
+5. `config.json` fallback only when no managed runtime source is available
+
+`session_mappings` may contain either:
+- an absolute / `~/...` profile path, or
+- a logical session id like `brand-session`, which resolves under `X_ENGAGE_BROWSER_PROFILE_ROOT` (default: `~/.x-engage-browser`)
+
 ### First-time X.com login
 
-`execute_actions.py` and `post_tweet.py` use **per-account persistent browser profiles** defined in `config.json` (`browser_profile` field per account, e.g. `~/.x-engage-browser/personal` and `~/.x-engage-browser/brand`).
+`execute_actions.py` and `post_tweet.py` use **per-account persistent browser profiles** from the managed runtime contract first, then fall back to `config.json` only if the managed source is unavailable.
 On the very first run for each account the browser will open to `x.com`. Log in to the correct account manually — the session is saved for all future runs.
 
 ### Runtime cadence
@@ -159,7 +180,8 @@ uv run python post_tweet.py --account personal --text "Hello world" \
 | `post_tweet.py` | Post original tweets with explicit MC approval |
 | `run_validation_wave.py` | Validation batch executor (requires approval in batch file) |
 | `run-engage.sh` | Shell wrapper for cron (loads .env, calls python3 analyze.py) |
-| `config.json` | Settings (paths, model, scoring weights, accounts) |
+| `config.json` | Local repo fallback for paths, model, scoring weights, and emergency account metadata |
+| `runtime_loader.py` | Shared Social OS runtime contract loader + fallback merger |
 | `.env` | API keys (not in git) |
 | `.env.example` | Template for keys |
 | `pending_actions.json` | Tweet queue managed by both scripts |
@@ -214,6 +236,10 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
 
 ## Config (`config.json`)
 
+`config.json` is now **fallback-only** for runtime account/browser settings. The normal operator control path is the managed Social OS runtime contract.
+
+Keep these fields in `config.json` for repo-local behavior and recovery:
+
 ```json
 {
   "x_monitor_window_path": "/path/to/x-monitor/tweets_window.json",
@@ -233,29 +259,27 @@ After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `e
       "browser_profile": "~/.x-engage-browser/personal",
       "min_confidence": 0.7,
       "action_types": ["retweet", "quote"]
-    },
-    {
-      "id": "brand",
-      "label": "@desearch_ai (brand)",
-      "handle": "desearch_ai",
-      "lane": "brand",
-      "browser_profile": "~/.x-engage-browser/brand",
-      "min_confidence": 0.8,
-      "action_types": ["quote"]
     }
   ]
 }
 ```
 
+When managed runtime is available, `x-engage` will:
+- replace `x_accounts` from `lane_routing` + `session_mappings`
+- use the managed `send_window` for `post_tweet.py` when `--send-window` is omitted
+- keep local-only fields like `x_monitor_window_path`, scoring weights, and Discord channel id
+
+Use `X_ENGAGE_RUNTIME_PATH` only as an explicit emergency override or in tests. Day-to-day edits should happen in Social OS, not in this repo.
+
 ---
 
 ## Multi-Account Architecture
 
-`analyze.py` generates one `pending_actions.json` entry **per tweet × account**. All accounts in `x_accounts` are processed — there is no `active_account` toggle.
+`analyze.py` generates one `pending_actions.json` entry **per tweet × account**. All accounts in the managed runtime `lane_routing` projection are processed — there is no `active_account` toggle.
 
-`execute_actions.py` groups approved actions by `account_id` and opens a **separate Chromium browser context** per account (each with its own `browser_profile`), so sessions never cross-contaminate. It now claims the shared queue lock before execution and validates explicit MC approval before any live action.
+`execute_actions.py` groups approved actions by `account_id` and opens a **separate Chromium browser context** per account (each with its own runtime-resolved browser profile), so sessions never cross-contaminate. It now claims the shared queue lock before execution and validates explicit MC approval before any live action.
 
-To add a new account: append an entry to `x_accounts` with its own `id`, `handle`, `lane`, `browser_profile`, and `action_types`. No code changes required.
+To add a new account in the normal path: update `lane_routing` + `session_mappings` in the Social OS runtime panel. Keep `config.json` account entries only for fallback metadata / recovery.
 
 ---
 
