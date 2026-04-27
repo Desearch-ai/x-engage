@@ -1,3 +1,4 @@
+import json
 """Tests for execute_actions.py — approval validation and per-account browser profile resolution."""
 import pytest
 from pathlib import Path
@@ -11,6 +12,7 @@ from execute_actions import (
     get_approved,
     validate_action_approval,
 )
+from analyze import load_config
 
 
 SAMPLE_CONFIG = {
@@ -184,3 +186,25 @@ class TestGetApproved:
 
     def test_empty_list(self):
         assert get_approved([]) == []
+
+
+class TestManagedRuntimeBrowserProfiles:
+    def test_resolves_browser_profile_from_managed_runtime_contract(self, tmp_path, monkeypatch):
+        runtime_path = tmp_path / "runtime.json"
+        runtime_path.write_text(json.dumps({
+            "lane_routing": {"brand": ["desearch_ai"]},
+            "session_mappings": {"desearch_ai": "brand-session"},
+            "send_window": {"start": "08:00", "end": "22:00", "tz": "UTC"},
+            "rate_limits": {"max_posts_per_day": 10, "max_replies_per_day": 20},
+            "check_interval_seconds": 3600,
+        }))
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(SAMPLE_CONFIG))
+        monkeypatch.setenv("X_ENGAGE_RUNTIME_PATH", str(runtime_path))
+        monkeypatch.setenv("X_ENGAGE_CONFIG", str(config_path))
+        monkeypatch.setenv("X_ENGAGE_BROWSER_PROFILE_ROOT", str(tmp_path / "profiles"))
+
+        cfg = load_config()
+        profile = get_browser_profile(cfg, "brand")
+
+        assert str(profile) == str((tmp_path / "profiles" / "brand-session").resolve())
