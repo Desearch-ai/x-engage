@@ -24,7 +24,7 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
-from runtime_loader import emit_social_runtime_event, load_config as load_runtime_config
+from runtime_loader import emit_social_runtime_event, load_config as load_runtime_config, write_social_os_review_rows
 
 # ─────────────────────────────────────────────
 # Config & Env
@@ -799,6 +799,9 @@ def run(dry_run: bool = False, skip_llm: bool = False, trigger: str | None = Non
     )
     queue_summary = write_pending_actions(queue_items, pending_path, run_metadata=trigger_info)
     result["queue_summary"] = queue_summary
+
+    social_os_summary = write_social_os_review_rows(queue_items)
+    result["social_os_summary"] = social_os_summary
 
     # Post digest to Discord
     bot_token = _get_discord_token()

@@ -90,6 +90,182 @@ def emit_social_runtime_event(event_type: str, message: str, metadata: dict[str,
     }])
 
 
+# ─────────────────────────────────────────────
+# Social OS review-row writer
+# ─────────────────────────────────────────────
+
+INACTIVE_SOCIAL_STATUSES = {"rejected", "approved", "posted"}
+
+
+def _build_social_post_row(item: dict[str, Any], angle: str) -> dict[str, Any]:
+    action_types = item.get("action_types", [])
+    account_handle = item.get("account_handle") or item.get("account_id", "")
+    lane = item.get("lane", "")
+    tweet_text = item.get("tweet_text", "")[:280]
+    author = item.get("author", "")
+    score = item.get("score", 0)
+    signal_url = item.get("source_signal_url") or item.get("tweet_url", "")
+    rationale = item.get("rationale", "")
+    fingerprint = item.get("generation_fingerprint", "")
+    category = item.get("category", "")
+
+    content = (
+        f"@{account_handle} · {lane} · {', '.join(action_types)}\n\n"
+        f"Signal from @{author} [{category}] (score: {score}):\n"
+        f'"{tweet_text}"\n\n'
+        f"Source: {signal_url}\n\n"
+        f"Rationale: {rationale}\n\n"
+        f"[x-engage/{fingerprint}]"
+    )
+    return {
+        "platform": "x",
+        "angle": angle,
+        "content": content,
+        "status": "draft",
+        "created_by": "x-engage-analyzer",
+    }
+
+
+def _extract_social_fingerprint(content: str) -> str:
+    """Extract generation fingerprint from '[x-engage/{fp}]' footer in content."""
+    import re
+    m = re.search(r"\[x-engage/([a-f0-9]+)\]", content)
+    return m.group(1) if m else ""
+
+
+def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Upsert Social OS social_posts review rows for queue items.
+
+    Dedup key: angle = 'x-engage:{signal_id}:{account_id}' (stable per signal×account pair).
+    - No existing row → INSERT with status='draft'.
+    - Existing draft row → UPDATE content (refresh).
+    - Existing inactive row (rejected/approved/posted) with same generation fingerprint → SKIP.
+    - Existing inactive row with changed fingerprint → UPDATE to status='draft' with new content.
+
+    Emits failure telemetry instead of raising on partial write failures.
+    Returns counts: created, refreshed, skipped, total.
+    """
+    if not items:
+        return {"created": 0, "refreshed": 0, "skipped": 0, "total": 0}
+
+    url, key = _supabase_runtime_env()
+    if not url or not key:
+        print("[social-os] Supabase env not configured; skipping social_posts write", file=sys.stderr)
+        return {"created": 0, "refreshed": 0, "skipped": 0, "total": 0, "skipped_reason": "no_supabase_env"}
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    angle_map: dict[str, dict[str, Any]] = {}
+    for item in items:
+        signal_id = item.get("source_signal_id") or item.get("tweet_id", "")
+        account_id = item.get("account_id", "")
+        angle = f"x-engage:{signal_id}:{account_id}"
+        angle_map[angle] = item
+
+    angles = list(angle_map.keys())
+    angle_list = ",".join(angles)
+
+    try:
+        resp = requests.get(
+            f"{url}/rest/v1/social_posts",
+            headers=headers,
+            params={
+                "select": "id,angle,status,content",
+                "platform": "eq.x",
+                "created_by": "eq.x-engage-analyzer",
+                "angle": f"in.({angle_list})",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        existing_by_angle: dict[str, dict[str, Any]] = {row["angle"]: row for row in resp.json()}
+    except Exception as exc:
+        emit_social_runtime_event(
+            "error",
+            f"social_posts dedup query failed: {exc}",
+            {"item_count": len(items)},
+        )
+        return {"created": 0, "refreshed": 0, "skipped": 0, "total": 0, "error": str(exc)}
+
+    to_insert: list[dict[str, Any]] = []
+    to_update: list[tuple[str, dict[str, Any]]] = []
+    skipped = 0
+
+    for angle, item in angle_map.items():
+        row_data = _build_social_post_row(item, angle)
+        existing = existing_by_angle.get(angle)
+
+        if existing is None:
+            to_insert.append(row_data)
+            continue
+
+        existing_status = str(existing.get("status") or "").lower()
+        if existing_status in INACTIVE_SOCIAL_STATUSES:
+            existing_fp = _extract_social_fingerprint(existing.get("content", ""))
+            new_fp = item.get("generation_fingerprint", "")
+            if existing_fp == new_fp:
+                skipped += 1
+                continue
+            to_update.append((existing["id"], {**row_data, "status": "draft"}))
+        else:
+            to_update.append((existing["id"], {"content": row_data["content"]}))
+
+    created = 0
+    refreshed = 0
+
+    if to_insert:
+        try:
+            resp = requests.post(
+                f"{url}/rest/v1/social_posts",
+                headers={**headers, "Prefer": "return=minimal"},
+                json=to_insert,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            created = len(to_insert)
+        except Exception as exc:
+            emit_social_runtime_event(
+                "error",
+                f"social_posts batch insert failed: {exc}",
+                {"count": len(to_insert)},
+            )
+
+    for row_id, update_payload in to_update:
+        try:
+            resp = requests.patch(
+                f"{url}/rest/v1/social_posts",
+                headers={**headers, "Prefer": "return=minimal"},
+                params={"id": f"eq.{row_id}"},
+                json=update_payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            refreshed += 1
+        except Exception as exc:
+            emit_social_runtime_event(
+                "error",
+                f"social_posts update failed for row {row_id}: {exc}",
+                {"row_id": row_id},
+            )
+
+    summary = {
+        "created": created,
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "total": created + refreshed + skipped,
+    }
+    print(
+        f"[social-os] Review rows: {created} created, {refreshed} refreshed, {skipped} skipped",
+        file=sys.stderr,
+    )
+    return summary
+
+
 def _ensure_str(value: Any, fallback: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else fallback
 
