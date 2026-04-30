@@ -2,6 +2,7 @@
 import json
 import pytest
 from pathlib import Path
+from unittest.mock import MagicMock
 from analyze import (
     score_tweet,
     get_top_tweets,
@@ -11,6 +12,8 @@ from analyze import (
     load_config,
     _username,
 )
+import runtime_loader
+from runtime_loader import write_social_os_review_rows
 
 SAMPLE_CONFIG = {
     "x_accounts": [
@@ -374,3 +377,199 @@ class TestQueueTelemetrySchema:
         assert summary["skipped"] == 0
         assert updated[0]["status"] == "pending"
         assert updated[0]["previous_status"] == "rejected"
+
+
+# ── Social OS review-row writer ───────────────────────────────────────────────
+
+def _make_response(status_code=201, json_data=None):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_data if json_data is not None else []
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+class TestSocialOSReviewRows:
+    def _queue_items(self):
+        accounts = [SAMPLE_CONFIG["x_accounts"][0]]
+        return build_queue_items([TWEET_A], accounts, criteria={"score_weights": SAMPLE_CONFIG["score_weights"]})
+
+    def test_queue_item_payload_has_required_social_os_fields(self):
+        items = self._queue_items()
+        item = items[0]
+        assert item["source_signal_id"] == "tweet_001"
+        assert item["source_signal_url"] == "https://x.com/user/status/001"
+        assert "account_id" in item
+        assert "account_handle" in item
+        assert "lane" in item
+        assert "action_types" in item
+        assert item["generation_fingerprint"]
+        assert item["rationale"]
+
+    def test_creates_rows_without_manual_seeding(self, monkeypatch):
+        """Normal analyzer run produces Social OS review rows; no manual DB seeding needed."""
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+
+        get_calls = []
+        post_calls = []
+
+        def fake_get(url, headers, params, timeout):
+            get_calls.append(params)
+            return _make_response(200, [])  # no existing rows
+
+        def fake_post(url, headers, json, timeout):
+            post_calls.append(json)
+            return _make_response(201)
+
+        monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+        monkeypatch.setattr(runtime_loader.requests, "post", fake_post)
+
+        items = self._queue_items()
+        summary = write_social_os_review_rows(items)
+
+        assert summary["created"] == 1
+        assert summary["refreshed"] == 0
+        assert summary["skipped"] == 0
+        assert len(post_calls) == 1
+        inserted = post_calls[0][0]
+        assert inserted["platform"] == "x"
+        assert inserted["status"] == "draft"
+        assert inserted["created_by"] == "x-engage-analyzer"
+        assert "tweet_001" in inserted["angle"]
+        assert "https://x.com/user/status/001" in inserted["content"]
+        assert inserted["content"].count("[x-engage/") == 1
+
+    def test_dedupes_inactive_row_with_same_generation_fingerprint(self, monkeypatch):
+        """Rejected/approved row with same fingerprint is skipped, not duplicated."""
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+
+        items = self._queue_items()
+        fingerprint = items[0]["generation_fingerprint"]
+        angle = f"x-engage:tweet_001:{items[0]['account_id']}"
+        existing_content = f"some content [x-engage/{fingerprint}]"
+
+        def fake_get(url, headers, params, timeout):
+            return _make_response(200, [
+                {"id": "row-uuid-1", "angle": angle, "status": "rejected", "content": existing_content},
+            ])
+
+        post_calls = []
+        patch_calls = []
+        monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+        monkeypatch.setattr(runtime_loader.requests, "post", lambda *a, **kw: post_calls.append(True) or _make_response(201))
+        monkeypatch.setattr(runtime_loader.requests, "patch", lambda *a, **kw: patch_calls.append(True) or _make_response(200))
+
+        summary = write_social_os_review_rows(items)
+
+        assert summary["skipped"] == 1
+        assert summary["created"] == 0
+        assert summary["refreshed"] == 0
+        assert not post_calls
+        assert not patch_calls
+
+    def test_refreshes_inactive_row_when_generation_fingerprint_changes(self, monkeypatch):
+        """Rejected row reopened as draft when source signal or criteria materially changed."""
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+
+        items = self._queue_items()
+        angle = f"x-engage:tweet_001:{items[0]['account_id']}"
+        stale_content = "old content [x-engage/0000000000000000]"
+
+        def fake_get(url, headers, params, timeout):
+            return _make_response(200, [
+                {"id": "row-uuid-2", "angle": angle, "status": "rejected", "content": stale_content},
+            ])
+
+        patch_calls = []
+
+        def fake_patch(url, headers, params, json, timeout):
+            patch_calls.append({"params": params, "json": json})
+            return _make_response(200)
+
+        monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+        monkeypatch.setattr(runtime_loader.requests, "post", lambda *a, **kw: _make_response(201))
+        monkeypatch.setattr(runtime_loader.requests, "patch", fake_patch)
+
+        summary = write_social_os_review_rows(items)
+
+        assert summary["refreshed"] == 1
+        assert summary["skipped"] == 0
+        assert summary["created"] == 0
+        assert patch_calls[0]["json"]["status"] == "draft"
+        assert "https://x.com/user/status/001" in patch_calls[0]["json"]["content"]
+
+    def test_refreshes_draft_row_without_changing_status(self, monkeypatch):
+        """Existing draft row gets updated content without toggling its status."""
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+
+        items = self._queue_items()
+        angle = f"x-engage:tweet_001:{items[0]['account_id']}"
+
+        def fake_get(url, headers, params, timeout):
+            return _make_response(200, [
+                {"id": "row-uuid-3", "angle": angle, "status": "draft", "content": "old content"},
+            ])
+
+        patch_calls = []
+
+        def fake_patch(url, headers, params, json, timeout):
+            patch_calls.append({"params": params, "json": json})
+            return _make_response(200)
+
+        monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+        monkeypatch.setattr(runtime_loader.requests, "post", lambda *a, **kw: _make_response(201))
+        monkeypatch.setattr(runtime_loader.requests, "patch", fake_patch)
+
+        summary = write_social_os_review_rows(items)
+
+        assert summary["refreshed"] == 1
+        assert summary["created"] == 0
+        assert "status" not in patch_calls[0]["json"]
+        assert "content" in patch_calls[0]["json"]
+
+    def test_returns_zero_counts_when_no_supabase_env(self, monkeypatch):
+        """Gracefully no-ops when Supabase credentials are absent."""
+        monkeypatch.delenv("SOCIAL_OS_SUPABASE_URL", raising=False)
+        monkeypatch.delenv("SUPABASE_URL", raising=False)
+        monkeypatch.delenv("VITE_SUPABASE_URL", raising=False)
+        monkeypatch.delenv("SOCIAL_OS_SUPABASE_KEY", raising=False)
+        monkeypatch.delenv("SOCIAL_OS_SUPABASE_ANON_KEY", raising=False)
+        monkeypatch.delenv("SUPABASE_ANON_KEY", raising=False)
+        monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+        monkeypatch.delenv("VITE_SUPABASE_ANON_KEY", raising=False)
+
+        items = self._queue_items()
+        summary = write_social_os_review_rows(items)
+
+        assert summary["created"] == 0
+        assert summary["refreshed"] == 0
+        assert summary["skipped"] == 0
+
+    def test_emits_telemetry_on_query_failure(self, monkeypatch):
+        """GET failure emits error telemetry rather than propagating the exception."""
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+
+        def boom(*a, **kw):
+            raise RuntimeError("connection refused")
+
+        telemetry = []
+
+        def fake_post(url, headers, json, timeout):
+            if "social_runtime_events" in url:
+                telemetry.append(json)
+            return _make_response(201)
+
+        monkeypatch.setattr(runtime_loader.requests, "get", boom)
+        monkeypatch.setattr(runtime_loader.requests, "post", fake_post)
+
+        items = self._queue_items()
+        summary = write_social_os_review_rows(items)
+
+        assert summary["created"] == 0
+        assert "error" in summary
+        assert any("dedup query failed" in str(t) for t in telemetry)
