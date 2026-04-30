@@ -47,7 +47,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from runtime_loader import load_config
+from runtime_loader import emit_social_runtime_event, load_config, safe_session_health_summary
 try:
     from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 except ModuleNotFoundError:
@@ -141,6 +141,55 @@ def get_browser_profile(cfg: dict, account_id: str) -> Path:
             if raw:
                 return Path(raw).expanduser().resolve()
     return _default_browser_profile()
+
+
+def _account_lookup(cfg: dict) -> dict[str, dict]:
+    lookup: dict[str, dict] = {}
+    for acct in cfg.get("x_accounts", []):
+        for key in (acct.get("id"), acct.get("handle")):
+            if key:
+                lookup[str(key)] = acct
+    return lookup
+
+
+def build_execution_event_metadata(
+    item: dict,
+    account: dict | None,
+    *,
+    dry_run: bool,
+    result: str,
+    error: str = "",
+) -> dict:
+    """Build Social OS-safe executor lifecycle metadata for one action item."""
+    account = account or {"id": item.get("account_id", "default")}
+    session_health = account.get("session_health") or safe_session_health_summary(account)
+    metadata = {
+        "dry_run": dry_run,
+        "result": result,
+        "action": {
+            "tweet_id": item.get("tweet_id"),
+            "tweet_url": item.get("tweet_url"),
+            "action_type": item.get("action"),
+            "status": item.get("status"),
+            "author": item.get("author"),
+        },
+        "account": {
+            "id": item.get("account_id") or account.get("id"),
+            "handle": account.get("handle") or item.get("account_handle"),
+            "label": account.get("label") or item.get("account_label"),
+            "lane": account.get("lane") or item.get("lane"),
+            "session_health": session_health,
+        },
+        "approval": {
+            "provenance_required": True,
+            "approval_status": item.get("approval_status"),
+            "approval_url": item.get("approval_url"),
+            "approved_by": item.get("approved_by"),
+        },
+    }
+    if error:
+        metadata["error"] = error[:500]
+    return metadata
 
 
 # ─────────────────────────────────────────────
@@ -387,6 +436,7 @@ async def run_executor(dry_run: bool = False) -> int:
         cfg = load_config()
     except Exception:
         cfg = {}
+    accounts_by_key = _account_lookup(cfg)
 
     lock_handle = acquire_queue_lock(PENDING_ACTIONS_PATH)
     try:
@@ -395,7 +445,18 @@ async def run_executor(dry_run: bool = False) -> int:
 
         if not approved:
             print("[executor] No approved actions found in pending_actions.json.")
+            emit_social_runtime_event(
+                "info",
+                "Executor found no approved x-engage actions",
+                {"dry_run": dry_run, "approved_count": 0},
+            )
             return 0
+
+        emit_social_runtime_event(
+            "info",
+            f"Executor evaluating {len(approved)} approved action(s)",
+            {"dry_run": dry_run, "approved_count": len(approved), "approval_provenance_required": True},
+        )
 
         # Filter out items without explicit MC approval (for both dry-run and live)
         # In dry-run mode, we show what would be rejected; in live mode, we reject
@@ -418,6 +479,24 @@ async def run_executor(dry_run: bool = False) -> int:
             print(f"\n[executor] ⚠️ {len(rejected_for_approval)} item(s) rejected (no explicit MC approval):")
             for a, reason in rejected_for_approval:
                 print(f"  ❌ @{a.get('author','?')} ({a.get('account_id','?')}): {reason}")
+            emit_social_runtime_event(
+                "warn",
+                f"Executor rejected {len(rejected_for_approval)} item(s) missing approval provenance",
+                {
+                    "dry_run": dry_run,
+                    "rejected_count": len(rejected_for_approval),
+                    "items": [
+                        build_execution_event_metadata(
+                            a,
+                            accounts_by_key.get(str(a.get("account_id", ""))),
+                            dry_run=dry_run,
+                            result="approval_rejected",
+                            error=reason,
+                        )
+                        for a, reason in rejected_for_approval[:20]
+                    ],
+                },
+            )
 
         if not explicitly_approved:
             print("\n[executor] No items with valid explicit MC approval. Exiting.")
@@ -428,6 +507,11 @@ async def run_executor(dry_run: bool = False) -> int:
                     a["error"] = reason
                     a["rejected_at"] = datetime.now(timezone.utc).isoformat()
                 save_actions(actions)
+            emit_social_runtime_event(
+                "warn",
+                "Executor exiting with no items carrying valid explicit approval",
+                {"dry_run": dry_run, "rejected_count": len(rejected_for_approval)},
+            )
             return 0 if dry_run else 1
 
         print(f"\n[executor] ✓ {len(explicitly_approved)} item(s) with valid explicit MC approval:")
@@ -446,6 +530,23 @@ async def run_executor(dry_run: bool = False) -> int:
                     qt = a.get("quote_text", "")
                     print(f"     quote_text: {qt[:120]}{'…' if len(qt) > 120 else ''}")
                 print(f"     approval_url: {a.get('approval_url', 'NONE')}")
+            emit_social_runtime_event(
+                "info",
+                f"Executor dry-run validated {len(explicitly_approved)} action(s)",
+                {
+                    "dry_run": True,
+                    "would_execute_count": len(explicitly_approved),
+                    "items": [
+                        build_execution_event_metadata(
+                            a,
+                            accounts_by_key.get(str(a.get("account_id", ""))),
+                            dry_run=True,
+                            result="would_execute",
+                        )
+                        for a in explicitly_approved[:20]
+                    ],
+                },
+            )
             print("[dry-run] Done (no browser launched).")
             return 0
 
@@ -470,9 +571,21 @@ async def run_executor(dry_run: bool = False) -> int:
 
         async with async_playwright() as p:
             for acct_id, acct_items in account_groups.items():
+                account_meta = accounts_by_key.get(str(acct_id), {"id": acct_id})
                 profile_dir = get_browser_profile(cfg, acct_id)
                 profile_dir.mkdir(parents=True, exist_ok=True)
+                session_health = safe_session_health_summary({**account_meta, "browser_profile": str(profile_dir)})
                 print(f"\n[executor] Account '{acct_id}' — profile: {profile_dir}")
+                emit_social_runtime_event(
+                    "info",
+                    f"Executor starting account batch for {acct_id}",
+                    {
+                        "dry_run": False,
+                        "account_id": acct_id,
+                        "item_count": len(acct_items),
+                        "session_health": session_health,
+                    },
+                )
 
                 context = await p.chromium.launch_persistent_context(
                     str(profile_dir),
@@ -492,6 +605,16 @@ async def run_executor(dry_run: bool = False) -> int:
                             "   The browser will remain open.\n"
                             "   Please log in manually, then re-run this script.\n",
                             file=sys.stderr,
+                        )
+                        emit_social_runtime_event(
+                            "error",
+                            f"Executor session login check failed for {acct_id}",
+                            {
+                                "dry_run": False,
+                                "account_id": acct_id,
+                                "session_health": session_health,
+                                "skipped_reason": "x_login_required",
+                            },
                         )
                         await context.close()
                         any_failed = True
@@ -516,6 +639,16 @@ async def run_executor(dry_run: bool = False) -> int:
                         item["status"] = "executing"
                         item["execution_started_at"] = datetime.now(timezone.utc).isoformat()
                         save_actions(actions)
+                        emit_social_runtime_event(
+                            "info",
+                            f"Executor started {action_type} for tweet {tweet_id}",
+                            build_execution_event_metadata(
+                                item,
+                                {**account_meta, "session_health": session_health},
+                                dry_run=False,
+                                result="started",
+                            ),
+                        )
 
                         if action_type == "retweet":
                             await execute_retweet(page, tweet_url)
@@ -528,6 +661,16 @@ async def run_executor(dry_run: bool = False) -> int:
                         item["executed_at"] = datetime.now(timezone.utc).isoformat()
                         success = True
                         print(f"[executor] ✓ {action_type} completed for tweet {tweet_id}")
+                        emit_social_runtime_event(
+                            "info",
+                            f"Executor completed {action_type} for tweet {tweet_id}",
+                            build_execution_event_metadata(
+                                item,
+                                {**account_meta, "session_health": session_health},
+                                dry_run=False,
+                                result="executed",
+                            ),
+                        )
                     except Exception as exc:
                         error_msg = str(exc)
                         item["status"] = "failed"
@@ -535,6 +678,17 @@ async def run_executor(dry_run: bool = False) -> int:
                         item["failed_at"] = datetime.now(timezone.utc).isoformat()
                         any_failed = True
                         print(f"[executor] ✗ {action_type} FAILED for {tweet_id}: {error_msg}", file=sys.stderr)
+                        emit_social_runtime_event(
+                            "error",
+                            f"Executor failed {action_type} for tweet {tweet_id}",
+                            build_execution_event_metadata(
+                                item,
+                                {**account_meta, "session_health": session_health},
+                                dry_run=False,
+                                result="failed",
+                                error=error_msg,
+                            ),
+                        )
 
                     save_actions(actions)
                     post_confirmation(bot_token, item, success, error_msg)
@@ -560,6 +714,17 @@ async def run_executor(dry_run: bool = False) -> int:
         failed = sum(1 for a in actions if a.get("status") == "failed")
         rejected = len(rejected_for_approval)
         print(f"\n[executor] Summary: {done} done, {failed} failed, {rejected} rejected (no approval) out of {len(approved)} total approved actions.")
+        emit_social_runtime_event(
+            "error" if any_failed else "info",
+            f"Executor live run finished: {done} done, {failed} failed, {rejected} approval rejected",
+            {
+                "dry_run": False,
+                "done": done,
+                "failed": failed,
+                "approval_rejected": rejected,
+                "approved_count": len(approved),
+            },
+        )
         return 1 if any_failed else 0
     finally:
         lock_handle.close()

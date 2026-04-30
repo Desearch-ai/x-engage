@@ -315,3 +315,62 @@ class TestManagedRuntimeAccounts:
         assert accounts[0]["handle"] == "new_handle"
         assert accounts[0]["label"] == "@new_handle"
         assert accounts[0]["lane"] == "research"
+
+# ── Social OS telemetry + queue lifecycle ─────────────────────────────────────
+
+class TestQueueTelemetrySchema:
+    def test_queue_item_includes_social_os_lifecycle_fields(self):
+        accounts = get_accounts(SAMPLE_CONFIG)
+        items = build_queue_items([TWEET_A], accounts, criteria={"score_weights": SAMPLE_CONFIG["score_weights"]})
+        item = items[0]
+
+        assert item["source_signal_id"] == "tweet_001"
+        assert item["source_signal_url"] == "https://x.com/user/status/001"
+        assert item["monitored_source"]["username"] == "testuser"
+        assert item["target_account"]["id"] == item["account_id"]
+        assert item["target_account"]["lane"] == item["lane"]
+        assert item["rationale"]
+        assert item["priority"] in {"high", "medium", "low"}
+        assert "risk_notes" in item
+        assert "duplicate_notes" in item
+        assert "generated_at" in item
+        assert item["status"] == "pending"
+        assert item["generation_criteria"]["score_weights"] == SAMPLE_CONFIG["score_weights"]
+        assert item["generation_fingerprint"]
+
+    def test_write_pending_actions_returns_counts_and_keeps_rejected_out_when_unchanged(self, tmp_path):
+        out = tmp_path / "pending.json"
+        accounts = [SAMPLE_CONFIG["x_accounts"][0]]
+        items = build_queue_items([TWEET_A], accounts, criteria={"score_weights": SAMPLE_CONFIG["score_weights"]})
+        first = write_pending_actions(items, str(out))
+        assert first["created"] == 1
+
+        data = json.loads(out.read_text())
+        data[0]["status"] = "rejected"
+        data[0]["review_notes"] = "not relevant"
+        out.write_text(json.dumps(data))
+
+        second = write_pending_actions(items, str(out))
+        updated = json.loads(out.read_text())
+        assert second["created"] == 0
+        assert second["refreshed"] == 0
+        assert second["skipped"] == 1
+        assert updated[0]["status"] == "rejected"
+        assert updated[0]["review_notes"] == "not relevant"
+
+    def test_write_pending_actions_reopens_rejected_when_criteria_materially_change(self, tmp_path):
+        out = tmp_path / "pending.json"
+        accounts = [SAMPLE_CONFIG["x_accounts"][0]]
+        original = build_queue_items([TWEET_A], accounts, criteria={"score_weights": SAMPLE_CONFIG["score_weights"]})
+        write_pending_actions(original, str(out))
+        data = json.loads(out.read_text())
+        data[0]["status"] = "rejected"
+        out.write_text(json.dumps(data))
+
+        changed = build_queue_items([{**TWEET_A, "_score": 999.0}], accounts, criteria={"score_weights": {"likes": 99}})
+        summary = write_pending_actions(changed, str(out))
+        updated = json.loads(out.read_text())
+        assert summary["refreshed"] == 1
+        assert summary["skipped"] == 0
+        assert updated[0]["status"] == "pending"
+        assert updated[0]["previous_status"] == "rejected"

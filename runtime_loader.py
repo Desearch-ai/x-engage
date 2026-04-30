@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,81 @@ import requests
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
 DEFAULT_BROWSER_PROFILE_ROOT = Path.home() / ".x-engage-browser"
+
+SOCIAL_RUNTIME_SERVICE = "x-engage"
+
+
+def _redact_path(path_value: str | None) -> str | None:
+    """Return only the last path component so Social OS never receives local paths."""
+    if not path_value:
+        return None
+    try:
+        return Path(path_value).expanduser().name or "configured"
+    except Exception:
+        return "configured"
+
+
+def safe_session_health_summary(account: dict[str, Any]) -> dict[str, Any]:
+    """Build a Social OS-safe account/session summary without exposing host paths or secrets."""
+    raw_profile = str(account.get("browser_profile") or "").strip()
+    profile_path = Path(raw_profile).expanduser() if raw_profile else None
+    profile_exists = bool(profile_path.exists()) if profile_path else False
+    return {
+        "account_id": account.get("id"),
+        "handle": account.get("handle") or account.get("id"),
+        "label": account.get("label"),
+        "lane": account.get("lane"),
+        "profile_configured": bool(raw_profile),
+        "profile_key": _redact_path(raw_profile),
+        "profile_exists": profile_exists,
+        "action_types": account.get("action_types", []),
+    }
+
+
+def emit_social_runtime_events(events: list[dict[str, Any]]) -> bool:
+    """Best-effort batch insert into Social OS social_runtime_events."""
+    if not events:
+        return False
+    url, key = _supabase_runtime_env()
+    if not url or not key:
+        return False
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for event in events:
+        rows.append({
+            "service": SOCIAL_RUNTIME_SERVICE,
+            "event_type": event.get("event_type", "info"),
+            "message": str(event.get("message", ""))[:500],
+            "metadata": event.get("metadata") or {},
+            "created_at": event.get("created_at") or now,
+        })
+
+    try:
+        response = requests.post(
+            f"{url}/rest/v1/social_runtime_events",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json=rows,
+            timeout=10,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as exc:
+        print(f"[social-os] Could not emit runtime event(s): {exc}", file=sys.stderr)
+        return False
+
+
+def emit_social_runtime_event(event_type: str, message: str, metadata: dict[str, Any] | None = None) -> bool:
+    return emit_social_runtime_events([{
+        "event_type": event_type,
+        "message": message,
+        "metadata": metadata or {},
+    }])
 
 
 def _ensure_str(value: Any, fallback: str) -> str:
@@ -226,6 +303,7 @@ def build_managed_accounts(
                 ),
                 "action_types": action_types,
             })
+            account["session_health"] = safe_session_health_summary(account)
             accounts.append(account)
 
     return accounts

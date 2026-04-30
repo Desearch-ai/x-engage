@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -23,7 +24,7 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
-from runtime_loader import load_config as load_runtime_config
+from runtime_loader import emit_social_runtime_event, load_config as load_runtime_config
 
 # ─────────────────────────────────────────────
 # Config & Env
@@ -130,29 +131,101 @@ def get_top_tweets(tweets: list[dict], weights: dict, top_n: int) -> list[dict]:
 # Queue Generation
 # ─────────────────────────────────────────────
 
-def build_queue_items(tweets: list[dict], accounts: list[dict]) -> list[dict]:
+def _signal_id(tweet: dict) -> str:
+    return str(tweet.get("id") or tweet.get("tweet_id") or tweet.get("url") or "")
+
+
+def _tweet_priority(score: float | int | None) -> str:
+    score_value = float(score or 0)
+    if score_value >= 500:
+        return "high"
+    if score_value >= 150:
+        return "medium"
+    return "low"
+
+
+def _stable_hash(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def build_queue_items(tweets: list[dict], accounts: list[dict], criteria: dict[str, Any] | None = None) -> list[dict]:
     """
     Build richer queue items for each tweet × account pair.
     Returns one item per (tweet, account) combination.
     """
     now = datetime.now(timezone.utc).isoformat()
+    criteria = criteria or {}
     items: list[dict] = []
     for tweet in tweets:
+        username = _username(tweet)
+        signal_id = _signal_id(tweet)
+        signal_url = tweet.get("url", "")
+        score = tweet.get("_score", 0)
+        category = tweet.get("_monitor_category", "")
+        monitored_source = {
+            "username": username,
+            "category": category,
+            "source": tweet.get("source") or tweet.get("_monitor_source") or "x-monitor",
+        }
         for acct in accounts:
+            account_id = acct["id"]
+            account_handle = acct.get("handle") or account_id
+            lane = acct.get("lane", "unknown")
+            action_types = acct.get("action_types", ["retweet", "quote"])
+            generation_criteria = {
+                "selected_by": "top_score",
+                "score": score,
+                "category": category,
+                "action_types": action_types,
+                "lane": lane,
+                **criteria,
+            }
+            fingerprint_payload = {
+                "signal_id": signal_id,
+                "signal_url": signal_url,
+                "account_id": account_id,
+                "lane": lane,
+                "generation_criteria": generation_criteria,
+            }
+            priority = _tweet_priority(score)
+            rationale = (
+                f"Selected from x-monitor {category or 'uncategorized'} signals "
+                f"with engagement score {score}; queued for {acct.get('label', account_id)} "
+                f"because lane '{lane}' allows {', '.join(action_types)}."
+            )
             items.append({
-                "tweet_id": tweet.get("id", ""),
-                "tweet_url": tweet.get("url", ""),
+                "tweet_id": signal_id,
+                "tweet_url": signal_url,
                 "tweet_text": tweet.get("text", "")[:280],
-                "author": _username(tweet),
-                "score": tweet.get("_score", 0),
+                "author": username,
+                "score": score,
                 "action": "pending",
-                "account_id": acct["id"],
-                "account_label": acct.get("label", f"@{acct['id']}"),
-                "lane": acct.get("lane", "unknown"),
-                "action_types": acct.get("action_types", ["retweet", "quote"]),
+                "status": "pending",
+                "account_id": account_id,
+                "account_handle": account_handle,
+                "account_label": acct.get("label", f"@{account_id}"),
+                "lane": lane,
+                "action_types": action_types,
                 "source": "x-engage-analyzer",
-                "category": tweet.get("_monitor_category", ""),
+                "category": category,
                 "timestamp": now,
+                "generated_at": now,
+                "source_signal_id": signal_id,
+                "source_signal_url": signal_url,
+                "monitored_source": monitored_source,
+                "target_account": {
+                    "id": account_id,
+                    "handle": account_handle,
+                    "label": acct.get("label", f"@{account_id}"),
+                    "lane": lane,
+                },
+                "rationale": rationale,
+                "priority": priority,
+                "risk_notes": "Requires explicit MC approval before execution; executor blocks missing approval provenance.",
+                "duplicate_notes": "No duplicate pending item detected at generation time.",
+                "generation_criteria": generation_criteria,
+                "generation_fingerprint": _stable_hash(fingerprint_payload),
             })
     return items
 
@@ -474,10 +547,14 @@ def post_to_discord(channel_id: str, bot_token: str, messages: list[dict]) -> No
 # Pending Actions
 # ─────────────────────────────────────────────
 
-def write_pending_actions(items: list[dict], output_path: str) -> None:
+INACTIVE_REVIEW_STATUSES = {"rejected", "approval_rejected", "skipped", "done"}
+
+
+def write_pending_actions(items: list[dict], output_path: str, run_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     Write queue items to pending_actions.json for the X Action Executor.
     Merges with existing entries, deduplicating by (tweet_id, account_id) while preserving review state.
+    Rejected/skipped/done items are kept out of the active queue unless the generation fingerprint changes.
     """
     path = Path(output_path).expanduser()
     if not path.is_absolute():
@@ -496,6 +573,8 @@ def write_pending_actions(items: list[dict], output_path: str) -> None:
         merged: list[dict] = []
         refreshed = 0
         new_count = 0
+        skipped = 0
+        skipped_items: list[dict[str, Any]] = []
 
         for item in items:
             key = (item.get("tweet_id", ""), item.get("account_id", ""))
@@ -505,20 +584,59 @@ def write_pending_actions(items: list[dict], output_path: str) -> None:
                 new_count += 1
                 continue
 
+            prior_status = str(prior.get("status") or prior.get("action") or "").lower()
+            same_generation = prior.get("generation_fingerprint") == item.get("generation_fingerprint")
+            if prior_status in INACTIVE_REVIEW_STATUSES and same_generation:
+                prior["duplicate_notes"] = (
+                    f"Suppressed duplicate queue candidate on {datetime.now(timezone.utc).isoformat()} "
+                    f"because prior item is {prior_status} and generation criteria did not materially change."
+                )
+                merged.append(prior)
+                skipped += 1
+                skipped_items.append({
+                    "tweet_id": item.get("tweet_id"),
+                    "account_id": item.get("account_id"),
+                    "status": prior_status,
+                    "reason": "duplicate_inactive_same_generation",
+                })
+                continue
+
             preserved = {
                 key_name: prior[key_name]
                 for key_name in (
-                    "action", "status", "quote_text", "approved_at", "reviewed_at", "review_notes",
-                    "execution_started_at", "executed_at", "failed_at", "error"
+                    "action", "status", "quote_text", "approval_status", "approval_url", "approved_by",
+                    "approved_at", "reviewed_at", "review_notes", "execution_started_at", "executed_at",
+                    "failed_at", "error"
                 )
-                if key_name in prior
+                if key_name in prior and not (prior_status in INACTIVE_REVIEW_STATUSES and not same_generation)
             }
-            merged.append({**item, **preserved})
+            refreshed_item = {**item, **preserved}
+            if prior_status in INACTIVE_REVIEW_STATUSES and not same_generation:
+                refreshed_item["previous_status"] = prior_status
+                refreshed_item["duplicate_notes"] = "Prior inactive item reopened because source signal or generation criteria materially changed."
+            elif prior_status:
+                refreshed_item["duplicate_notes"] = f"Refreshed existing queue item while preserving review status '{prior_status}'."
+            merged.append(refreshed_item)
             refreshed += 1
 
         merged.extend(existing_map.values())
         atomic_write_json(path, merged)
-        print(f"[pending_actions] Written {new_count} new entries, refreshed {refreshed}, total {len(merged)} → {path}", file=sys.stderr)
+        summary = {
+            "created": new_count,
+            "refreshed": refreshed,
+            "skipped": skipped,
+            "total": len(merged),
+            "output_path": str(path),
+            "skipped_items": skipped_items,
+            **(run_metadata or {}),
+        }
+        print(f"[pending_actions] Written {new_count} new entries, refreshed {refreshed}, skipped {skipped}, total {len(merged)} → {path}", file=sys.stderr)
+        emit_social_runtime_event(
+            "info",
+            f"Queue refreshed: {new_count} created, {refreshed} refreshed, {skipped} skipped",
+            {"queue_summary": summary},
+        )
+        return summary
     finally:
         lock_handle.close()
 
@@ -527,8 +645,30 @@ def write_pending_actions(items: list[dict], output_path: str) -> None:
 # Main
 # ─────────────────────────────────────────────
 
-def run(dry_run: bool = False, skip_llm: bool = False) -> dict[str, Any]:
+def _trigger_context(cfg: dict[str, Any], dry_run: bool, trigger: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+    env_trigger = os.environ.get("X_ENGAGE_TRIGGER", "").strip().lower()
+    trigger_type = (trigger or env_trigger or ("manual" if dry_run else "scheduled")).strip().lower()
+    if trigger_type not in {"manual", "scheduled"}:
+        trigger_type = "manual"
+    run_identifier = (
+        run_id
+        or os.environ.get("X_ENGAGE_RUN_ID")
+        or os.environ.get("X_ENGAGE_MANUAL_RUN_ID")
+        or f"x-engage-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    return {
+        "run_id": run_identifier,
+        "trigger": trigger_type,
+        "dry_run": dry_run,
+        "scheduled_interval_seconds": cfg.get("engage_check_interval_seconds")
+            or int(float(cfg.get("trigger_interval_hours", 4)) * 3600),
+        "runtime_source": cfg.get("runtime_source", "config_fallback"),
+    }
+
+
+def run(dry_run: bool = False, skip_llm: bool = False, trigger: str | None = None, run_id: str | None = None) -> dict[str, Any]:
     cfg = load_config()
+    trigger_info = _trigger_context(cfg, dry_run=dry_run, trigger=trigger, run_id=run_id)
 
     # Load all configured X accounts
     accounts = get_accounts(cfg)
@@ -559,6 +699,28 @@ def run(dry_run: bool = False, skip_llm: bool = False) -> dict[str, Any]:
     # Score & rank
     top_10 = get_top_tweets(tweets, weights, top_n)
     print(f"[analyze] Top {len(top_10)} tweets selected", file=sys.stderr)
+    selected_signals = [
+        {
+            "id": _signal_id(t),
+            "url": t.get("url"),
+            "author": _username(t),
+            "score": t.get("_score", 0),
+            "category": t.get("_monitor_category", ""),
+        }
+        for t in top_10
+    ]
+    analysis_input_metadata = {
+        **trigger_info,
+        "x_monitor_window_path": str(window_path),
+        "signal_counts": {"loaded": len(tweets), "selected": len(top_10), "deep_dive": min(len(top_10), top_deep)},
+        "selected_signals": selected_signals,
+        "generation_criteria": {"score_weights": weights, "top_n": top_n, "top_deep_dive": top_deep},
+    }
+    emit_social_runtime_event(
+        "info",
+        f"Analyzer selected {len(top_10)} of {len(tweets)} x-monitor signals",
+        analysis_input_metadata,
+    )
 
     # LLM: only top-3 get deep-dive (cost-efficient — not all 10)
     top_for_deep = top_10[:top_deep]
@@ -613,17 +775,30 @@ def run(dry_run: bool = False, skip_llm: bool = False) -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tweet_count_in_window": len(tweets),
         "llm_mode": "fallback" if skip_llm else "live",
+        "trigger": trigger_info,
+        "generation_criteria": {"score_weights": weights, "top_n": top_n, "top_deep_dive": top_deep},
+        "selected_signals": selected_signals,
     }
 
     if dry_run:
+        emit_social_runtime_event(
+            "info",
+            f"Analyzer dry-run completed: {len(top_10)} selected signals, no queue write",
+            {**trigger_info, "queue_summary": {"created": 0, "refreshed": 0, "skipped": 0}, "selected_signals": selected_signals},
+        )
         # Stdout = pure JSON; all logs were sent to stderr
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return result
 
     # Write pending actions for human review — one item per tweet × account
     pending_path = cfg.get("pending_actions_path", "pending_actions.json")
-    queue_items = build_queue_items(top_for_deep, accounts)
-    write_pending_actions(queue_items, pending_path)
+    queue_items = build_queue_items(
+        top_for_deep,
+        accounts,
+        criteria={"score_weights": weights, "top_n": top_n, "top_deep_dive": top_deep, "window_path": str(window_path)},
+    )
+    queue_summary = write_pending_actions(queue_items, pending_path, run_metadata=trigger_info)
+    result["queue_summary"] = queue_summary
 
     # Post digest to Discord
     bot_token = _get_discord_token()
@@ -639,6 +814,11 @@ def run(dry_run: bool = False, skip_llm: bool = False) -> dict[str, Any]:
     )
     post_to_discord(channel_id, bot_token, discord_msgs)
     print(f"[done] Engagement report posted to Discord #{channel_id}", file=sys.stderr)
+    emit_social_runtime_event(
+        "info",
+        f"Analyzer run completed via {trigger_info['trigger']} trigger",
+        {**trigger_info, "queue_summary": result.get("queue_summary", {}), "discord_channel_id": channel_id},
+    )
 
     return result
 
@@ -655,10 +835,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Use local fallback analysis/content ideas instead of remote LLM calls",
     )
+    parser.add_argument(
+        "--trigger",
+        choices=["manual", "scheduled"],
+        default=None,
+        help="Annotate Social OS telemetry with the run trigger model",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional run identifier propagated into Social OS telemetry",
+    )
     args = parser.parse_args()
 
     try:
-        run(dry_run=args.dry_run, skip_llm=args.skip_llm)
+        run(dry_run=args.dry_run, skip_llm=args.skip_llm, trigger=args.trigger, run_id=args.run_id)
         sys.exit(0)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)

@@ -208,3 +208,34 @@ class TestManagedRuntimeBrowserProfiles:
         profile = get_browser_profile(cfg, "brand")
 
         assert str(profile) == str((tmp_path / "profiles" / "brand-session").resolve())
+
+# ── Social OS execution telemetry helpers ─────────────────────────────────────
+
+class TestExecutionTelemetry:
+    def test_executor_event_metadata_redacts_session_path(self, tmp_path):
+        account = {
+            "id": "brand",
+            "handle": "desearch_ai",
+            "lane": "brand",
+            "label": "@desearch_ai",
+            "browser_profile": str(tmp_path / "secret-profile"),
+            "session_health": {
+                "account_id": "brand",
+                "handle": "desearch_ai",
+                "lane": "brand",
+                "profile_configured": True,
+                "profile_key": "secret-profile",
+                "profile_exists": False,
+            },
+        }
+        metadata = execute_actions.build_execution_event_metadata(
+            {"tweet_id": "1", "account_id": "brand", "action": "retweet", "approval_url": "https://mc/approval"},
+            account,
+            dry_run=True,
+            result="would_execute",
+        )
+        assert metadata["account"]["session_health"]["profile_key"] == "secret-profile"
+        assert "browser_profile" not in json.dumps(metadata)
+        assert str(tmp_path) not in json.dumps(metadata)
+        assert metadata["approval"]["provenance_required"] is True
+        assert metadata["approval"]["approval_url"] == "https://mc/approval"
