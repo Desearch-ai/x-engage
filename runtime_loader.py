@@ -316,6 +316,84 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def _social_post_to_action(row: dict[str, Any]) -> dict[str, Any]:
+    """Map an approved social_posts row to the action dict format used by execute_actions.py."""
+    angle = row.get("angle", "")
+    # angle format: "x-engage:{signal_id}:{account_id}"
+    parts = angle.split(":", 2)
+    account_id = parts[2] if len(parts) == 3 else (row.get("account_handle") or "default")
+
+    raw_post_type = (row.get("post_type") or "").strip()
+    action = raw_post_type.split(",")[0].strip() if raw_post_type else "retweet"
+    if action not in ("retweet", "quote"):
+        action = "retweet"
+
+    return {
+        "tweet_id": row.get("source_signal_id") or "",
+        "tweet_url": row.get("source_url") or "",
+        "author": row.get("monitored_account") or "",
+        "action": action,
+        "quote_text": row.get("quote_text") or "",
+        "account_id": account_id,
+        "account_handle": row.get("account_handle") or "",
+        "account_label": row.get("account_label") or "",
+        "lane": row.get("lane") or "",
+        "status": "approved",
+        "approval_status": row.get("approval_status") or "",
+        "approval_url": row.get("approval_url") or "",
+        "approved_by": row.get("approved_by") or "",
+        "social_os_row_id": row.get("id"),
+        "_source": "social_os",
+    }
+
+
+def load_social_os_approved_rows() -> list[dict[str, Any]]:
+    """
+    Fetch Social OS social_posts rows with approval_status='approved' for x-engage execution.
+
+    Queries the social_posts table for platform='x' rows that have been approved in Social OS
+    and have not yet been posted. Maps each row to the action dict format understood by
+    execute_actions.py, preserving approval provenance (approval_url, approved_by).
+
+    Returns [] if Supabase is not configured or the query fails (best-effort, non-fatal).
+    """
+    url, key = _supabase_runtime_env()
+    if not url or not key:
+        return []
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
+
+    try:
+        resp = requests.get(
+            f"{url}/rest/v1/social_posts",
+            headers=headers,
+            params={
+                "select": "id,angle,platform,post_type,source_signal_id,source_url,"
+                          "monitored_account,account_handle,account_label,lane,"
+                          "approval_status,approval_url,approved_by,status,quote_text",
+                "platform": "eq.x",
+                "approval_status": "eq.approved",
+                "status": "neq.posted",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not isinstance(rows, list):
+            print("[social-os] Unexpected response from social_posts query", file=sys.stderr)
+            return []
+        actions = [_social_post_to_action(row) for row in rows]
+        print(f"[social-os] Loaded {len(actions)} approved Social OS row(s) for execution", file=sys.stderr)
+        return actions
+    except Exception as exc:
+        print(f"[social-os] Could not load approved social_posts rows: {exc}", file=sys.stderr)
+        return []
+
+
 def _ensure_str(value: Any, fallback: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else fallback
 

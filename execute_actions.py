@@ -2,32 +2,39 @@
 """
 x-engage: X Action Executor
 
-Reads pending_actions.json, finds items with status=approved AND explicit
-MC approval (approval_status='approved' + approval_url), and executes
-the requested action (retweet / quote tweet) via Playwright on x.com.
+Loads approved actions from two sources (Social OS primary, pending_actions.json fallback),
+validates explicit MC approval provenance, and executes the requested action
+(retweet / quote tweet) via Playwright on x.com.
+
+INPUT PATHS:
+1. Social OS approved rows (PRIMARY): rows in the social_posts Supabase table with
+   approval_status='approved' and platform='x', loaded via load_social_os_approved_rows().
+   These rows carry approval provenance set by the Social OS operator UI.
+2. pending_actions.json (FALLBACK): local file used when Social OS is not configured or
+   has no approved rows. Remains supported for backwards compatibility and manual import.
 
 APPROVAL CONTRACT:
 - Live execution REQUIRES explicit per-post approval from Mission Control
-- Required fields:
+- Required fields (both sources):
   - status: "approved"
   - approval_status: "approved" (explicit, not implied)
   - approval_url: URL of approval (provenance for audit)
 - Posts lacking approval_status='approved' are rejected at the door
 
-Schema expected in pending_actions.json:
+Schema expected (pending_actions.json and Social OS mapped rows share this shape):
 {
-  "tweet_id":   "123",
-  "tweet_url":  "https://x.com/user/status/123",
-  "tweet_text": "...",
-  "author":     "username",
-  "action":     "retweet" | "quote",
-  "quote_text": "...",          # required for action=quote
-  "status":     "pending" | "approved" | "done" | "skipped" | "failed",
-  "approval_status": "approved",   # REQUIRED for live execution
-  "approval_url": "...",            # REQUIRED for live execution
-  "approved_by": "...",             # recommended for audit
-  "timestamp":  "2024-...",
-  "executed_at": "..."              # set by this script after execution
+  "tweet_id":         "123",
+  "tweet_url":        "https://x.com/user/status/123",
+  "author":           "username",
+  "action":           "retweet" | "quote",
+  "quote_text":       "...",          # required for action=quote
+  "account_id":       "...",
+  "status":           "approved",
+  "approval_status":  "approved",     # REQUIRED for live execution
+  "approval_url":     "...",          # REQUIRED for live execution
+  "approved_by":      "...",          # recommended for audit
+  "social_os_row_id": "...",          # present for Social OS source rows
+  "_source":          "social_os" | "pending_actions"
 }
 
 Usage:
@@ -47,7 +54,12 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from runtime_loader import emit_social_runtime_event, load_config, safe_session_health_summary
+from runtime_loader import (
+    emit_social_runtime_event,
+    load_config,
+    load_social_os_approved_rows,
+    safe_session_health_summary,
+)
 try:
     from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 except ModuleNotFoundError:
@@ -428,7 +440,11 @@ async def run_executor(dry_run: bool = False) -> int:
     Returns exit code: 0 = success (or nothing to do), 1 = one or more failures.
     Groups approved actions by account_id and opens a separate browser context
     per account using its configured profile directory.
-    
+
+    Input source selection:
+    - Primary: Social OS approved rows loaded via load_social_os_approved_rows().
+    - Fallback: pending_actions.json, used when Social OS is not configured or has no rows.
+
     CRITICAL: Validates explicit MC approval (approval_status='approved' + approval_url)
     before any live execution. Items without valid approval are rejected at the door.
     """
@@ -438,9 +454,28 @@ async def run_executor(dry_run: bool = False) -> int:
         cfg = {}
     accounts_by_key = _account_lookup(cfg)
 
-    lock_handle = acquire_queue_lock(PENDING_ACTIONS_PATH)
+    # ── Source selection: Social OS (primary) or pending_actions.json (fallback) ──
+    social_os_actions = load_social_os_approved_rows()
+    lock_handle = None
+    file_actions: list[dict] = []
+
+    if social_os_actions:
+        actions = social_os_actions
+        _using_file = False
+        print(f"[executor] Using Social OS as primary source: {len(actions)} approved row(s).")
+    else:
+        try:
+            lock_handle = acquire_queue_lock(PENDING_ACTIONS_PATH)
+        except RuntimeError as exc:
+            print(f"[executor] {exc}", file=sys.stderr)
+            emit_social_runtime_event("error", f"Executor queue lock failed: {exc}", {"dry_run": dry_run})
+            return 1
+        file_actions = load_actions()
+        actions = file_actions
+        _using_file = True
+        print("[executor] Social OS not available or no approved rows; using pending_actions.json.")
+
     try:
-        actions = load_actions()
         approved = get_approved(actions)
 
         if not approved:
@@ -500,8 +535,8 @@ async def run_executor(dry_run: bool = False) -> int:
 
         if not explicitly_approved:
             print("\n[executor] No items with valid explicit MC approval. Exiting.")
-            if not dry_run:
-                # Mark rejected items in the queue
+            if not dry_run and _using_file:
+                # Mark rejected items in the queue (file path only)
                 for a, reason in rejected_for_approval:
                     a["status"] = "approval_rejected"
                     a["error"] = reason
@@ -522,10 +557,14 @@ async def run_executor(dry_run: bool = False) -> int:
             print(f"      Approval: {approval_url[:60]}..." if len(approval_url) > 60 else f"      Approval: {approval_url}")
 
         if dry_run:
-            print("\n[dry-run] Actions that would be executed:")
+            source_label = "Social OS" if not _using_file else "pending_actions.json"
+            print(f"\n[dry-run] Actions that would be executed (source: {source_label}):")
             for a in explicitly_approved:
                 acct = a.get("account_id", "?")
+                row_id = a.get("social_os_row_id")
                 print(f"  → {a['action'].upper()} tweet {a['tweet_id']} by @{a.get('author','?')} as {acct}")
+                if row_id:
+                    print(f"     social_os_row_id: {row_id}")
                 if a["action"] == "quote":
                     qt = a.get("quote_text", "")
                     print(f"     quote_text: {qt[:120]}{'…' if len(qt) > 120 else ''}")
@@ -638,7 +677,8 @@ async def run_executor(dry_run: bool = False) -> int:
                     try:
                         item["status"] = "executing"
                         item["execution_started_at"] = datetime.now(timezone.utc).isoformat()
-                        save_actions(actions)
+                        if _using_file:
+                            save_actions(actions)
                         emit_social_runtime_event(
                             "info",
                             f"Executor started {action_type} for tweet {tweet_id}",
@@ -690,7 +730,8 @@ async def run_executor(dry_run: bool = False) -> int:
                             ),
                         )
 
-                    save_actions(actions)
+                    if _using_file:
+                        save_actions(actions)
                     post_confirmation(bot_token, item, success, error_msg)
 
                     remaining = any(
@@ -702,12 +743,13 @@ async def run_executor(dry_run: bool = False) -> int:
 
                 await context.close()
 
-        # Handle rejected items in the queue
-        for a, reason in rejected_for_approval:
-            a["status"] = "approval_rejected"
-            a["error"] = reason
-            a["rejected_at"] = datetime.now(timezone.utc).isoformat()
-        save_actions(actions)
+        # Handle rejected items in the queue (file path only)
+        if _using_file:
+            for a, reason in rejected_for_approval:
+                a["status"] = "approval_rejected"
+                a["error"] = reason
+                a["rejected_at"] = datetime.now(timezone.utc).isoformat()
+            save_actions(actions)
 
         total = len(explicitly_approved)
         done = sum(1 for a in actions if a.get("status") == "done")
@@ -727,7 +769,8 @@ async def run_executor(dry_run: bool = False) -> int:
         )
         return 1 if any_failed else 0
     finally:
-        lock_handle.close()
+        if lock_handle is not None:
+            lock_handle.close()
 
 # ─────────────────────────────────────────────
 # Entry point
