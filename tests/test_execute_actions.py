@@ -239,3 +239,90 @@ class TestExecutionTelemetry:
         assert str(tmp_path) not in json.dumps(metadata)
         assert metadata["approval"]["provenance_required"] is True
         assert metadata["approval"]["approval_url"] == "https://mc/approval"
+
+
+# ── Social OS approved-row executor path ──────────────────────────────────────
+
+class TestSocialOSExecutorPath:
+    """Tests verifying execute_actions consumes approved Social OS rows correctly."""
+
+    def _make_social_os_action(self, **overrides) -> dict:
+        base = {
+            "tweet_id": "tweet-111",
+            "tweet_url": "https://x.com/researcher/status/111",
+            "author": "researcher",
+            "action": "retweet",
+            "quote_text": "",
+            "account_id": "brand",
+            "account_handle": "desearch_ai",
+            "account_label": "@desearch_ai",
+            "lane": "brand",
+            "status": "approved",
+            "approval_status": "approved",
+            "approval_url": "https://mc.desearch.ai/tasks/802",
+            "approved_by": "Giga",
+            "social_os_row_id": "uuid-abc-123",
+            "_source": "social_os",
+        }
+        base.update(overrides)
+        return base
+
+    def test_social_os_row_passes_approval_validation(self):
+        item = self._make_social_os_action()
+        is_valid, reason = validate_action_approval(item)
+        assert is_valid is True
+        assert "Giga" in reason
+
+    def test_social_os_row_missing_approval_url_fails(self):
+        item = self._make_social_os_action(approval_url="")
+        is_valid, reason = validate_action_approval(item)
+        assert is_valid is False
+        assert "missing approval_url" in reason
+
+    def test_social_os_row_pending_approval_status_fails(self):
+        item = self._make_social_os_action(approval_status="pending")
+        is_valid, reason = validate_action_approval(item)
+        assert is_valid is False
+        assert "pending" in reason
+
+    def test_social_os_row_missing_approval_status_fails(self):
+        item = self._make_social_os_action(approval_status="")
+        is_valid, reason = validate_action_approval(item)
+        assert is_valid is False
+        assert "missing approval_status" in reason
+
+    def test_get_approved_accepts_social_os_rows(self):
+        items = [
+            self._make_social_os_action(),
+            self._make_social_os_action(action="quote", tweet_id="tweet-222"),
+        ]
+        assert len(get_approved(items)) == 2
+
+    def test_get_approved_excludes_non_approved_social_os_rows(self):
+        items = [
+            self._make_social_os_action(status="draft"),
+            self._make_social_os_action(status="approved"),
+        ]
+        assert len(get_approved(items)) == 1
+
+    def test_social_os_row_id_present_in_item(self):
+        item = self._make_social_os_action()
+        assert item.get("social_os_row_id") == "uuid-abc-123"
+        assert item.get("_source") == "social_os"
+
+    def test_pending_actions_fallback_still_works(self, tmp_path, monkeypatch):
+        """pending_actions.json fallback is used when Social OS returns no rows."""
+        path = tmp_path / "pending.json"
+        monkeypatch.setattr(execute_actions, "PENDING_ACTIONS_PATH", path)
+        actions = [
+            {
+                "tweet_id": "t1",
+                "action": "retweet",
+                "status": "approved",
+                "approval_status": "approved",
+                "approval_url": "https://mc.desearch.ai/tasks/1",
+            }
+        ]
+        save_actions(actions)
+        loaded = load_actions()
+        assert get_approved(loaded) == actions

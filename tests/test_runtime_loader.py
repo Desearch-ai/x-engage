@@ -84,3 +84,127 @@ def test_build_social_post_row_includes_filter_and_account_routing_metadata():
     assert "Filter: qualified" in row["content"]
     assert "Account fit: Matches @desearch_ai technical/product strategy." in row["content"]
     assert "Confidence/risk: 0.83 / low" in row["content"]
+
+
+# ── Social OS approved-row loading ────────────────────────────────────────────
+
+def _sample_social_post_row(**overrides) -> dict:
+    base = {
+        "id": "row-uuid-001",
+        "angle": "x-engage:tweet-555:brand",
+        "platform": "x",
+        "post_type": "retweet",
+        "source_signal_id": "tweet-555",
+        "source_url": "https://x.com/author/status/555",
+        "monitored_account": "author",
+        "account_handle": "desearch_ai",
+        "account_label": "@desearch_ai",
+        "lane": "brand",
+        "approval_status": "approved",
+        "approval_url": "https://mc.desearch.ai/tasks/802",
+        "approved_by": "Giga",
+        "status": "approved",
+        "quote_text": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_social_post_to_action_maps_all_fields():
+    from runtime_loader import _social_post_to_action
+    row = _sample_social_post_row()
+    action = _social_post_to_action(row)
+
+    assert action["tweet_id"] == "tweet-555"
+    assert action["tweet_url"] == "https://x.com/author/status/555"
+    assert action["author"] == "author"
+    assert action["action"] == "retweet"
+    assert action["account_id"] == "brand"
+    assert action["account_handle"] == "desearch_ai"
+    assert action["lane"] == "brand"
+    assert action["status"] == "approved"
+    assert action["approval_status"] == "approved"
+    assert action["approval_url"] == "https://mc.desearch.ai/tasks/802"
+    assert action["approved_by"] == "Giga"
+    assert action["social_os_row_id"] == "row-uuid-001"
+    assert action["_source"] == "social_os"
+
+
+def test_social_post_to_action_extracts_account_from_angle():
+    from runtime_loader import _social_post_to_action
+    row = _sample_social_post_row(angle="x-engage:tweet-999:personal", account_handle="cosmic_desearch")
+    action = _social_post_to_action(row)
+    assert action["account_id"] == "personal"
+
+
+def test_social_post_to_action_falls_back_to_handle_when_angle_malformed():
+    from runtime_loader import _social_post_to_action
+    row = _sample_social_post_row(angle="bad-angle", account_handle="cosmic_desearch")
+    action = _social_post_to_action(row)
+    assert action["account_id"] == "cosmic_desearch"
+
+
+def test_social_post_to_action_normalises_post_type_to_action():
+    from runtime_loader import _social_post_to_action
+    row = _sample_social_post_row(post_type="quote,retweet")
+    action = _social_post_to_action(row)
+    assert action["action"] == "quote"
+
+
+def test_social_post_to_action_unknown_post_type_defaults_to_retweet():
+    from runtime_loader import _social_post_to_action
+    row = _sample_social_post_row(post_type="like")
+    action = _social_post_to_action(row)
+    assert action["action"] == "retweet"
+
+
+def test_load_social_os_approved_rows_returns_empty_when_no_env(monkeypatch):
+    from runtime_loader import load_social_os_approved_rows
+    monkeypatch.delenv("SOCIAL_OS_SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("VITE_SUPABASE_URL", raising=False)
+    result = load_social_os_approved_rows()
+    assert result == []
+
+
+def test_load_social_os_approved_rows_fetches_and_maps(monkeypatch):
+    from runtime_loader import load_social_os_approved_rows
+    import runtime_loader
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return [_sample_social_post_row()]
+
+    calls = []
+    def fake_get(url, headers, params, timeout):
+        calls.append({"url": url, "params": params})
+        return Response()
+
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+    monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+
+    result = load_social_os_approved_rows()
+
+    assert len(result) == 1
+    assert result[0]["tweet_id"] == "tweet-555"
+    assert result[0]["approval_status"] == "approved"
+    assert result[0]["_source"] == "social_os"
+    assert calls[0]["params"]["approval_status"] == "eq.approved"
+    assert calls[0]["params"]["platform"] == "eq.x"
+
+
+def test_load_social_os_approved_rows_returns_empty_on_error(monkeypatch):
+    from runtime_loader import load_social_os_approved_rows
+    import runtime_loader
+
+    def fake_get(*args, **kwargs):
+        raise Exception("network error")
+
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+    monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+
+    result = load_social_os_approved_rows()
+    assert result == []
