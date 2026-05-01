@@ -8,6 +8,8 @@ from analyze import (
     get_top_tweets,
     get_accounts,
     build_queue_items,
+    qualify_and_route_signals,
+    summarize_filter_decisions,
     write_pending_actions,
     load_config,
     _username,
@@ -204,6 +206,72 @@ class TestBuildQueueItems:
         assert build_queue_items([TWEET_A], []) == []
 
 
+
+# ── qualification / account routing ──────────────────────────────────────────
+
+class TestQualificationAndRouting:
+    def _accounts(self):
+        return [
+            {"id": "brand", "handle": "desearch_ai", "label": "@desearch_ai", "lane": "research", "action_types": ["quote"]},
+            {"id": "personal", "handle": "cosmicquantum", "label": "@cosmicquantum", "lane": "personal", "action_types": ["quote"]},
+        ]
+
+    def test_routes_brand_vs_personal_and_skips_irrelevant_high_score(self):
+        brand_signal = {**TWEET_A, "id": "brand-fit", "text": "SN22 AI search API builders need better web scraping infrastructure", "_score": 900.0}
+        personal_signal = {**TWEET_A, "id": "personal-fit", "text": "Founder build in public note: shipping a startup on Bittensor teaches you fast", "_score": 850.0}
+        irrelevant_signal = {**TWEET_A, "id": "irrelevant", "text": "Celebrity sports drama is trending today", "_score": 9999.0}
+        risky_signal = {**TWEET_A, "id": "risky", "text": "Bittensor price prediction: buy now before this pumps", "_score": 950.0}
+
+        decisions = qualify_and_route_signals(
+            [irrelevant_signal, brand_signal, personal_signal, risky_signal],
+            self._accounts(),
+        )
+
+        selected = [d for d in decisions if d["selected"]]
+        skipped = [d for d in decisions if not d["selected"]]
+        assert len(selected) == 2
+        assert len(skipped) == 2
+        assert {d["source_signal"]["id"]: d["selected_account"] for d in selected} == {
+            "brand-fit": "desearch_ai",
+            "personal-fit": "cosmicquantum",
+        }
+        assert {d["skipped_reason"] for d in skipped} == {"no_account_strategy_match", "negative_filter_match"}
+        for decision in decisions:
+            assert "account_fit_reason" in decision
+            assert "writing_standard_check" in decision
+            assert "source_signal" in decision
+            assert "confidence" in decision
+            assert "risk" in decision
+
+    def test_build_queue_items_accepts_routing_decisions_not_account_cross_product(self):
+        tweets = [
+            {**TWEET_A, "id": "brand-fit", "text": "desearch SN22 AI search API launch for developers", "_score": 900.0},
+            {**TWEET_A, "id": "personal-fit", "text": "founder build in public lesson from shipping a startup", "_score": 800.0},
+            {**TWEET_A, "id": "irrelevant", "text": "unrelated viral entertainment update", "_score": 5000.0},
+        ]
+        decisions = qualify_and_route_signals(tweets, self._accounts())
+        items = build_queue_items(tweets, self._accounts(), qualification_decisions=decisions)
+
+        assert len(items) == 2
+        assert {item["account_handle"] for item in items} == {"desearch_ai", "cosmicquantum"}
+        assert all(item["filter_status"] == "qualified" for item in items)
+        assert all(item["account_fit_reason"] for item in items)
+        assert all(item["writing_standard_check"]["status"] == "passed" for item in items)
+
+    def test_filter_summary_counts_selected_and_skipped_by_account_lane(self):
+        tweets = [
+            {**TWEET_A, "id": "brand-fit", "text": "desearch AI search API for Bittensor developers", "_score": 900.0},
+            {**TWEET_A, "id": "skip-fit", "text": "generic viral post with no strategic match", "_score": 9000.0},
+        ]
+        decisions = qualify_and_route_signals(tweets, self._accounts())
+        summary = summarize_filter_decisions(decisions)
+
+        assert summary["selected"] == 1
+        assert summary["skipped"] == 1
+        assert summary["selected_by_account"] == {"desearch_ai": 1}
+        assert summary["selected_by_lane"] == {"research": 1}
+        assert summary["skipped_by_reason"] == {"no_account_strategy_match": 1}
+
 # ── write_pending_actions ────────────────────────────────────────────────────
 
 class TestWritePendingActions:
@@ -258,6 +326,34 @@ class TestWritePendingActions:
         account_ids = {d["account_id"] for d in data}
         assert "personal" in account_ids
         assert "brand" in account_ids
+
+    def test_queue_summary_records_filter_run_metadata(self, tmp_path):
+        out = tmp_path / "pending.json"
+        accounts = [
+            {"id": "brand", "handle": "desearch_ai", "label": "@desearch_ai", "lane": "research", "action_types": ["quote"]},
+        ]
+        tweets = [
+            {**TWEET_A, "id": "brand-fit", "text": "desearch SN22 AI search API launch", "_score": 900.0},
+            {**TWEET_A, "id": "skip-fit", "text": "generic viral entertainment update", "_score": 9000.0},
+        ]
+        decisions = qualify_and_route_signals(tweets, accounts)
+        items = build_queue_items(tweets, accounts, qualification_decisions=decisions)
+        filter_summary = summarize_filter_decisions(decisions)
+
+        summary = write_pending_actions(
+            items,
+            str(out),
+            run_metadata={
+                "filter_criteria": {"stage": "filter_route_before_draft"},
+                "filter_summary": filter_summary,
+                "skipped_filter_decisions": [d for d in decisions if not d["selected"]],
+            },
+        )
+
+        assert summary["filter_criteria"] == {"stage": "filter_route_before_draft"}
+        assert summary["filter_summary"]["selected"] == 1
+        assert summary["filter_summary"]["skipped"] == 1
+        assert summary["skipped_filter_decisions"][0]["skipped_reason"] == "no_account_strategy_match"
 
 
 # ── managed runtime contract ───────────────────────────────────────────────────

@@ -2,8 +2,8 @@
 """
 x-engage: Engagement Analyzer + Discord Reporter
 Reads x-monitor tweets_window.json (24h sliding window), scores posts,
-runs GPT-4o-mini analysis on top-3 performers, generates content ideas
-for @desearch_ai, and posts a digest to Discord #x-alerts.
+runs GPT-4o-mini analysis on top performers, filters/routes qualified signals
+by account strategy, and posts a digest to Discord #x-alerts.
 
 Usage:
     python3 analyze.py              # Full run: analyze + post to Discord
@@ -127,6 +127,329 @@ def get_top_tweets(tweets: list[dict], weights: dict, top_n: int) -> list[dict]:
     return deduped[:top_n]
 
 
+
+# ─────────────────────────────────────────────
+# Qualification / Account Routing
+# ─────────────────────────────────────────────
+
+DEFAULT_ACCOUNT_FILTERS: dict[str, dict[str, Any]] = {
+    "desearch_ai": {
+        "positive": ["bittensor", "desearch", "sn22", "subnet22", "ai search", "search api", "web scraping", "developer", "api", "tao"],
+        "secondary": ["openai", "google search", "perplexity", "builders", "crawl", "scraping"],
+        "negative": ["crypto scam", "ponzi", "rug pull", "price prediction", "buy now", "pump"],
+        "min_confidence": 0.62,
+        "writing_standard": "Professional, authoritative, product-focused; max 1-2 tweets; sparing emoji; include a useful technical/product angle.",
+    },
+    "cosmicquantum": {
+        "positive": ["founder", "startup", "build in public", "building", "shipping", "behind the scenes", "bittensor", "tao"],
+        "secondary": ["depin", "ai agents", "network state", "learning", "market"],
+        "negative": ["shill", "buy now", "price prediction", "pump", "scam"],
+        "min_confidence": 0.58,
+        "writing_standard": "Authentic founder voice; first-person/story-driven; conversational; avoid corporate/product-announcement copy.",
+    },
+}
+
+ACCOUNT_FILTER_ALIASES: dict[str, str] = {
+    "brand": "desearch_ai",
+    "research": "desearch_ai",
+    "@desearch_ai": "desearch_ai",
+    "personal": "cosmicquantum",
+    "founder": "cosmicquantum",
+    "cosmic_desearch": "cosmicquantum",
+    "comic_desearch": "cosmicquantum",
+    "@cosmicquantum": "cosmicquantum",
+    "@cosmic_desearch": "cosmicquantum",
+}
+
+
+def _clean_terms(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _account_keys(account: dict[str, Any]) -> list[str]:
+    raw_keys = [
+        account.get("handle"),
+        account.get("id"),
+        account.get("lane"),
+        str(account.get("label", "")).replace("@", " "),
+    ]
+    keys: list[str] = []
+    for raw in raw_keys:
+        normalized = str(raw or "").replace("(", " ").replace(")", " ").replace("/", " ").replace(",", " ")
+        for part in normalized.split():
+            key = part.lstrip("@").strip().lower()
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def _canonical_account_key(account: dict[str, Any]) -> str:
+    for key in _account_keys(account):
+        canonical = ACCOUNT_FILTER_ALIASES.get(key, key)
+        if canonical in DEFAULT_ACCOUNT_FILTERS:
+            return canonical
+    return (_account_keys(account) or [str(account.get("id", "unknown"))])[0]
+
+
+def _configured_filter_for_account(account: dict[str, Any], account_filters: dict[str, Any] | None) -> dict[str, Any]:
+    config = account_filters if isinstance(account_filters, dict) else {}
+    keys = _account_keys(account)
+    canonical = _canonical_account_key(account)
+    candidates = [*keys, canonical]
+    selected: dict[str, Any] = {}
+    for key in candidates:
+        raw = config.get(key) or config.get(f"@{key}")
+        if isinstance(raw, dict):
+            selected = raw
+            break
+    defaults = DEFAULT_ACCOUNT_FILTERS.get(canonical, {})
+    return {
+        "positive": _clean_terms(selected.get("positive") or selected.get("primary") or selected.get("primary_keywords")) or defaults.get("positive", []),
+        "secondary": _clean_terms(selected.get("secondary") or selected.get("secondary_keywords")) or defaults.get("secondary", []),
+        "negative": _clean_terms(selected.get("negative") or selected.get("negative_filters")) or defaults.get("negative", []),
+        "min_confidence": float(selected.get("min_confidence") or defaults.get("min_confidence") or 0.55),
+        "writing_standard": str(selected.get("writing_standard") or defaults.get("writing_standard") or "Account-specific writing standard must be satisfied before review."),
+    }
+
+
+def _signal_text_blob(tweet: dict[str, Any]) -> str:
+    parts = [
+        tweet.get("text", ""),
+        tweet.get("_monitor_category", ""),
+        tweet.get("source", ""),
+        tweet.get("_monitor_source", ""),
+    ]
+    user = tweet.get("user")
+    if isinstance(user, dict):
+        parts.extend([user.get("username", ""), user.get("name", "")])
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _matched_terms(blob: str, terms: list[str]) -> list[str]:
+    return [term for term in terms if term.lower() in blob]
+
+
+def _source_signal(tweet: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _signal_id(tweet),
+        "url": tweet.get("url", ""),
+        "author": _username(tweet),
+        "text": tweet.get("text", "")[:280],
+        "score": tweet.get("_score", 0),
+        "category": tweet.get("_monitor_category", ""),
+        "source": tweet.get("source") or tweet.get("_monitor_source") or "x-monitor",
+    }
+
+
+def _confidence_for_match(score: float, positive_matches: list[str], secondary_matches: list[str]) -> float:
+    match_score = (0.18 * len(positive_matches)) + (0.08 * len(secondary_matches))
+    engagement_score = min(max(float(score or 0), 0.0) / 2500.0, 0.2)
+    return round(min(0.95, 0.42 + match_score + engagement_score), 2)
+
+
+def _risk_for_decision(confidence: float, score: float, negative_matches: list[str] | None = None) -> str:
+    if negative_matches:
+        return "high"
+    if confidence < 0.62 or float(score or 0) < 150:
+        return "medium"
+    return "low"
+
+
+def _writing_standard_check(account: dict[str, Any], filters: dict[str, Any], selected: bool) -> dict[str, Any]:
+    if not selected:
+        return {"status": "not_applicable", "summary": "Signal was not routed to an account, so no draft-writing standard was applied."}
+    handle = account.get("handle") or account.get("id")
+    return {
+        "status": "passed",
+        "account": handle,
+        "lane": account.get("lane", "unknown"),
+        "summary": filters.get("writing_standard", "Account-specific writing standard passed."),
+    }
+
+
+def qualify_and_route_signals(
+    tweets: list[dict],
+    accounts: list[dict],
+    account_filters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Explicit FILTER → ROUTE stage before draft/queue generation.
+
+    Returns one decision per source signal. Selected decisions route to exactly one
+    account strategy; skipped decisions preserve a human-readable reason so Social
+    OS/runtime telemetry can show why no draft was created.
+    """
+    decisions: list[dict[str, Any]] = []
+    for tweet in tweets:
+        source_signal = _source_signal(tweet)
+        blob = _signal_text_blob(tweet)
+        score = float(tweet.get("_score", 0) or 0)
+        candidates: list[dict[str, Any]] = []
+        negative_rejections: list[dict[str, Any]] = []
+
+        for account in accounts:
+            filters = _configured_filter_for_account(account, account_filters)
+            negative_matches = _matched_terms(blob, filters["negative"])
+            if negative_matches:
+                negative_rejections.append({
+                    "account": account.get("handle") or account.get("id"),
+                    "lane": account.get("lane"),
+                    "matched_negative_terms": negative_matches,
+                })
+                continue
+
+            positive_matches = _matched_terms(blob, filters["positive"])
+            secondary_matches = _matched_terms(blob, filters["secondary"])
+            if not positive_matches:
+                continue
+
+            confidence = _confidence_for_match(score, positive_matches, secondary_matches)
+            if confidence < filters["min_confidence"]:
+                continue
+
+            account_handle = account.get("handle") or account.get("id")
+            account_fit_score = (len(positive_matches) * 10) + (len(secondary_matches) * 3) + min(score / 1000.0, 5)
+            candidates.append({
+                "account": account,
+                "filters": filters,
+                "selected_account": account_handle,
+                "selected_account_id": account.get("id") or account_handle,
+                "selected_lane": account.get("lane", "unknown"),
+                "positive_matches": positive_matches,
+                "secondary_matches": secondary_matches,
+                "confidence": confidence,
+                "risk": _risk_for_decision(confidence, score),
+                "account_fit_score": round(account_fit_score, 2),
+            })
+
+        if candidates:
+            candidates.sort(key=lambda c: (c["account_fit_score"], c["confidence"]), reverse=True)
+            chosen = candidates[0]
+            account = chosen["account"]
+            filters = chosen["filters"]
+            handle = chosen["selected_account"]
+            keyword_list = chosen["positive_matches"] + chosen["secondary_matches"]
+            account_fit_reason = (
+                f"Routed to @{handle} ({account.get('lane', 'unknown')} lane) because the signal matched "
+                f"account strategy keyword(s): {', '.join(keyword_list)}."
+            )
+            decisions.append({
+                "selected": True,
+                "selected_account": handle,
+                "selected_account_id": chosen["selected_account_id"],
+                "selected_lane": chosen["selected_lane"],
+                "account_fit_reason": account_fit_reason,
+                "writing_standard_check": _writing_standard_check(account, filters, selected=True),
+                "skipped_reason": None,
+                "source_signal": source_signal,
+                "confidence": chosen["confidence"],
+                "risk": chosen["risk"],
+                "risk_notes": "Low risk after strategy filter; live execution still requires explicit Social OS approval provenance." if chosen["risk"] == "low" else "Review carefully before approval; strategy confidence is moderate.",
+                "matched_keywords": keyword_list,
+                "rejected_accounts": negative_rejections,
+                "account_fit_scores": [
+                    {
+                        "account": c["selected_account"],
+                        "lane": c["selected_lane"],
+                        "score": c["account_fit_score"],
+                        "confidence": c["confidence"],
+                        "matched_keywords": c["positive_matches"] + c["secondary_matches"],
+                    }
+                    for c in candidates
+                ],
+            })
+            continue
+
+        if negative_rejections:
+            skipped_reason = "negative_filter_match"
+            reason = "Skipped because account-level negative filter(s) matched: " + "; ".join(
+                f"@{r['account']}: {', '.join(r['matched_negative_terms'])}" for r in negative_rejections
+            )
+            risk = "high"
+        else:
+            skipped_reason = "no_account_strategy_match"
+            reason = "Skipped because no configured account strategy positive filter matched this signal."
+            risk = "medium"
+
+        decisions.append({
+            "selected": False,
+            "selected_account": None,
+            "selected_account_id": None,
+            "selected_lane": None,
+            "account_fit_reason": reason,
+            "writing_standard_check": _writing_standard_check({}, {}, selected=False),
+            "skipped_reason": skipped_reason,
+            "source_signal": source_signal,
+            "confidence": 0.0,
+            "risk": risk,
+            "risk_notes": reason,
+            "matched_keywords": [],
+            "rejected_accounts": negative_rejections,
+            "account_fit_scores": [],
+        })
+    return decisions
+
+
+def summarize_filter_decisions(decisions: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "selected": 0,
+        "skipped": 0,
+        "selected_by_account": {},
+        "selected_by_lane": {},
+        "skipped_by_reason": {},
+    }
+    for decision in decisions:
+        if decision.get("selected"):
+            summary["selected"] += 1
+            account = decision.get("selected_account") or "unknown"
+            lane = decision.get("selected_lane") or "unknown"
+            summary["selected_by_account"][account] = summary["selected_by_account"].get(account, 0) + 1
+            summary["selected_by_lane"][lane] = summary["selected_by_lane"].get(lane, 0) + 1
+        else:
+            summary["skipped"] += 1
+            reason = decision.get("skipped_reason") or "unknown"
+            summary["skipped_by_reason"][reason] = summary["skipped_by_reason"].get(reason, 0) + 1
+    return summary
+
+
+def _filter_criteria_metadata(account_filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    configured = account_filters if isinstance(account_filters, dict) else {}
+    return {
+        "stage": "filter_route_before_draft",
+        "routing_policy": "best_account_only",
+        "account_filters": configured or DEFAULT_ACCOUNT_FILTERS,
+        "account_filter_aliases": ACCOUNT_FILTER_ALIASES,
+        "standards_source": "~/.docs/cosmic-brain/projects/social-os/social-os-account-strategy-filtering-standards.md",
+    }
+
+
+def _account_for_decision(accounts: list[dict], decision: dict[str, Any]) -> dict[str, Any] | None:
+    selected_id = str(decision.get("selected_account_id") or "").lstrip("@").lower()
+    selected_handle = str(decision.get("selected_account") or "").lstrip("@").lower()
+    for account in accounts:
+        candidates = {
+            str(account.get("id", "")).lstrip("@").lower(),
+            str(account.get("handle", "")).lstrip("@").lower(),
+        }
+        if selected_id in candidates or selected_handle in candidates:
+            return account
+    return None
+
+
+def _tweet_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    source = decision.get("source_signal") or {}
+    return {
+        "id": source.get("id"),
+        "url": source.get("url"),
+        "text": source.get("text", ""),
+        "user": {"username": source.get("author", "?")},
+        "_score": source.get("score", 0),
+        "_monitor_category": source.get("category", ""),
+        "source": source.get("source", "x-monitor"),
+    }
+
 # ─────────────────────────────────────────────
 # Queue Generation
 # ─────────────────────────────────────────────
@@ -149,84 +472,129 @@ def _stable_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def build_queue_items(tweets: list[dict], accounts: list[dict], criteria: dict[str, Any] | None = None) -> list[dict]:
+def build_queue_items(
+    tweets: list[dict],
+    accounts: list[dict],
+    criteria: dict[str, Any] | None = None,
+    qualification_decisions: list[dict[str, Any]] | None = None,
+) -> list[dict]:
     """
-    Build richer queue items for each tweet × account pair.
-    Returns one item per (tweet, account) combination.
+    Build richer queue items.
+
+    Legacy/internal callers without qualification_decisions still receive one item
+    per tweet × account. Production analyzer flow passes explicit FILTER/ROUTE
+    decisions so only selected signals become draft/action review items.
     """
     now = datetime.now(timezone.utc).isoformat()
     criteria = criteria or {}
     items: list[dict] = []
-    for tweet in tweets:
+
+    if qualification_decisions is None:
+        queue_pairs = [
+            (tweet, acct, None)
+            for tweet in tweets
+            for acct in accounts
+        ]
+    else:
+        queue_pairs = []
+        for decision in qualification_decisions:
+            if not decision.get("selected"):
+                continue
+            acct = _account_for_decision(accounts, decision)
+            if acct is None:
+                continue
+            queue_pairs.append((_tweet_from_decision(decision), acct, decision))
+
+    for tweet, acct, decision in queue_pairs:
         username = _username(tweet)
         signal_id = _signal_id(tweet)
         signal_url = tweet.get("url", "")
         score = tweet.get("_score", 0)
         category = tweet.get("_monitor_category", "")
+        matched_keywords = (decision or {}).get("matched_keywords", [])
         monitored_source = {
             "username": username,
             "category": category,
             "source": tweet.get("source") or tweet.get("_monitor_source") or "x-monitor",
+            "matched_keywords": matched_keywords,
         }
-        for acct in accounts:
-            account_id = acct["id"]
-            account_handle = acct.get("handle") or account_id
-            lane = acct.get("lane", "unknown")
-            action_types = acct.get("action_types", ["retweet", "quote"])
-            generation_criteria = {
-                "selected_by": "top_score",
-                "score": score,
-                "category": category,
-                "action_types": action_types,
+        account_id = acct["id"]
+        account_handle = acct.get("handle") or account_id
+        lane = acct.get("lane", "unknown")
+        action_types = acct.get("action_types", ["retweet", "quote"])
+        filter_status = "qualified" if decision else "legacy_unfiltered"
+        writing_standard_check = (decision or {}).get("writing_standard_check", {})
+        account_fit_reason = (decision or {}).get("account_fit_reason") or (
+            f"Legacy queue candidate for {acct.get('label', account_id)}; no first-class filter decision supplied."
+        )
+        generation_criteria = {
+            "selected_by": "account_strategy_filter" if decision else "top_score",
+            "score": score,
+            "category": category,
+            "action_types": action_types,
+            "lane": lane,
+            "filter_status": filter_status,
+            "account_fit_reason": account_fit_reason,
+            "writing_standard_check": writing_standard_check,
+            "matched_keywords": matched_keywords,
+            **criteria,
+        }
+        fingerprint_payload = {
+            "signal_id": signal_id,
+            "signal_url": signal_url,
+            "account_id": account_id,
+            "lane": lane,
+            "generation_criteria": generation_criteria,
+        }
+        priority = _tweet_priority(score)
+        rationale = (
+            f"Selected from x-monitor {category or 'uncategorized'} signals "
+            f"with engagement score {score}; queued for {acct.get('label', account_id)} "
+            f"after account strategy filter: {account_fit_reason}"
+        )
+        risk_level = (decision or {}).get("risk", "low")
+        risk_notes = (decision or {}).get("risk_notes") or "Requires explicit MC approval before execution; executor blocks missing approval provenance."
+        items.append({
+            "tweet_id": signal_id,
+            "tweet_url": signal_url,
+            "tweet_text": tweet.get("text", "")[:280],
+            "author": username,
+            "score": score,
+            "action": "pending",
+            "status": "pending",
+            "account_id": account_id,
+            "account_handle": account_handle,
+            "account_label": acct.get("label", f"@{account_id}"),
+            "lane": lane,
+            "action_types": action_types,
+            "source": "x-engage-analyzer",
+            "category": category,
+            "timestamp": now,
+            "generated_at": now,
+            "source_signal_id": signal_id,
+            "source_signal_url": signal_url,
+            "monitored_source": monitored_source,
+            "target_account": {
+                "id": account_id,
+                "handle": account_handle,
+                "label": acct.get("label", f"@{account_id}"),
                 "lane": lane,
-                **criteria,
-            }
-            fingerprint_payload = {
-                "signal_id": signal_id,
-                "signal_url": signal_url,
-                "account_id": account_id,
-                "lane": lane,
-                "generation_criteria": generation_criteria,
-            }
-            priority = _tweet_priority(score)
-            rationale = (
-                f"Selected from x-monitor {category or 'uncategorized'} signals "
-                f"with engagement score {score}; queued for {acct.get('label', account_id)} "
-                f"because lane '{lane}' allows {', '.join(action_types)}."
-            )
-            items.append({
-                "tweet_id": signal_id,
-                "tweet_url": signal_url,
-                "tweet_text": tweet.get("text", "")[:280],
-                "author": username,
-                "score": score,
-                "action": "pending",
-                "status": "pending",
-                "account_id": account_id,
-                "account_handle": account_handle,
-                "account_label": acct.get("label", f"@{account_id}"),
-                "lane": lane,
-                "action_types": action_types,
-                "source": "x-engage-analyzer",
-                "category": category,
-                "timestamp": now,
-                "generated_at": now,
-                "source_signal_id": signal_id,
-                "source_signal_url": signal_url,
-                "monitored_source": monitored_source,
-                "target_account": {
-                    "id": account_id,
-                    "handle": account_handle,
-                    "label": acct.get("label", f"@{account_id}"),
-                    "lane": lane,
-                },
-                "rationale": rationale,
-                "priority": priority,
-                "risk_notes": "Requires explicit MC approval before execution; executor blocks missing approval provenance.",
-                "duplicate_notes": "No duplicate pending item detected at generation time.",
-                "generation_criteria": generation_criteria,
-                "generation_fingerprint": _stable_hash(fingerprint_payload),
-            })
+            },
+            "filter_status": filter_status,
+            "selected_account": account_handle,
+            "account_fit_reason": account_fit_reason,
+            "writing_standard_check": writing_standard_check,
+            "skipped_reason": None,
+            "confidence": (decision or {}).get("confidence"),
+            "risk": risk_level,
+            "matched_keywords": matched_keywords,
+            "rationale": rationale,
+            "priority": priority,
+            "risk_notes": risk_notes,
+            "duplicate_notes": "No duplicate pending item detected at generation time.",
+            "generation_criteria": generation_criteria,
+            "generation_fingerprint": _stable_hash(fingerprint_payload),
+        })
     return items
 
 
@@ -709,12 +1077,39 @@ def run(dry_run: bool = False, skip_llm: bool = False, trigger: str | None = Non
         }
         for t in top_10
     ]
+
+    account_filters = cfg.get("account_filters") or cfg.get("account_strategy_filters") or {}
+    filter_decisions = qualify_and_route_signals(top_10, accounts, account_filters=account_filters)
+    filter_summary = summarize_filter_decisions(filter_decisions)
+    filter_criteria = _filter_criteria_metadata(account_filters)
+    queued_filter_decisions = [d for d in filter_decisions if d.get("selected")][:top_deep]
+    skipped_filter_decisions = [d for d in filter_decisions if not d.get("selected")]
+    print(
+        f"[analyze] Filter routed {filter_summary['selected']} signal(s), skipped {filter_summary['skipped']} signal(s)",
+        file=sys.stderr,
+    )
+
     analysis_input_metadata = {
         **trigger_info,
         "x_monitor_window_path": str(window_path),
-        "signal_counts": {"loaded": len(tweets), "selected": len(top_10), "deep_dive": min(len(top_10), top_deep)},
+        "signal_counts": {
+            "loaded": len(tweets),
+            "selected": len(top_10),
+            "deep_dive": min(len(top_10), top_deep),
+            "filter_selected": filter_summary["selected"],
+            "filter_skipped": filter_summary["skipped"],
+            "queued_for_review": len(queued_filter_decisions),
+        },
         "selected_signals": selected_signals,
-        "generation_criteria": {"score_weights": weights, "top_n": top_n, "top_deep_dive": top_deep},
+        "filter_criteria": filter_criteria,
+        "filter_summary": filter_summary,
+        "filter_decisions": filter_decisions,
+        "generation_criteria": {
+            "score_weights": weights,
+            "top_n": top_n,
+            "top_deep_dive": top_deep,
+            "filter_stage": filter_criteria,
+        },
     }
     emit_social_runtime_event(
         "info",
@@ -776,28 +1171,57 @@ def run(dry_run: bool = False, skip_llm: bool = False, trigger: str | None = Non
         "tweet_count_in_window": len(tweets),
         "llm_mode": "fallback" if skip_llm else "live",
         "trigger": trigger_info,
-        "generation_criteria": {"score_weights": weights, "top_n": top_n, "top_deep_dive": top_deep},
+        "generation_criteria": {
+            "score_weights": weights,
+            "top_n": top_n,
+            "top_deep_dive": top_deep,
+            "filter_stage": filter_criteria,
+        },
         "selected_signals": selected_signals,
+        "filter_summary": filter_summary,
+        "filter_decisions": filter_decisions,
+        "skipped_filter_decisions": skipped_filter_decisions,
     }
 
     if dry_run:
         emit_social_runtime_event(
             "info",
             f"Analyzer dry-run completed: {len(top_10)} selected signals, no queue write",
-            {**trigger_info, "queue_summary": {"created": 0, "refreshed": 0, "skipped": 0}, "selected_signals": selected_signals},
+            {
+                **trigger_info,
+                "queue_summary": {"created": 0, "refreshed": 0, "skipped": 0},
+                "selected_signals": selected_signals,
+                "filter_summary": filter_summary,
+                "filter_decisions": filter_decisions,
+            },
         )
         # Stdout = pure JSON; all logs were sent to stderr
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return result
 
-    # Write pending actions for human review — one item per tweet × account
+    # Write pending actions for human review — only explicitly qualified/routed signals become drafts.
     pending_path = cfg.get("pending_actions_path", "pending_actions.json")
     queue_items = build_queue_items(
-        top_for_deep,
+        top_10,
         accounts,
-        criteria={"score_weights": weights, "top_n": top_n, "top_deep_dive": top_deep, "window_path": str(window_path)},
+        criteria={
+            "score_weights": weights,
+            "top_n": top_n,
+            "top_deep_dive": top_deep,
+            "window_path": str(window_path),
+            "filter_stage": filter_criteria,
+        },
+        qualification_decisions=queued_filter_decisions,
     )
-    queue_summary = write_pending_actions(queue_items, pending_path, run_metadata=trigger_info)
+    queue_run_metadata = {
+        **trigger_info,
+        "filter_criteria": filter_criteria,
+        "filter_summary": filter_summary,
+        "filter_decisions": filter_decisions,
+        "skipped_filter_decisions": skipped_filter_decisions,
+        "queued_filter_decisions": queued_filter_decisions,
+    }
+    queue_summary = write_pending_actions(queue_items, pending_path, run_metadata=queue_run_metadata)
     result["queue_summary"] = queue_summary
 
     social_os_summary = write_social_os_review_rows(queue_items)
