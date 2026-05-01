@@ -100,22 +100,55 @@ INACTIVE_SOCIAL_STATUSES = {"rejected", "approved", "posted"}
 def _build_social_post_row(item: dict[str, Any], angle: str) -> dict[str, Any]:
     action_types = item.get("action_types", [])
     account_handle = item.get("account_handle") or item.get("account_id", "")
+    account_label = item.get("account_label") or f"@{account_handle}"
     lane = item.get("lane", "")
     tweet_text = item.get("tweet_text", "")[:280]
     author = item.get("author", "")
     score = item.get("score", 0)
     signal_url = item.get("source_signal_url") or item.get("tweet_url", "")
-    rationale = item.get("rationale", "")
-    fingerprint = item.get("generation_fingerprint", "")
+    source_signal_id = item.get("source_signal_id") or item.get("tweet_id", "")
     category = item.get("category", "")
+    rationale = item.get("rationale", "")
+    account_fit_reason = item.get("account_fit_reason") or rationale
+    filter_status = item.get("filter_status", "unknown")
+    skipped_reason = item.get("skipped_reason")
+    writing_standard = item.get("writing_standard_check") or {}
+    writing_status = writing_standard.get("status", "unknown")
+    writing_summary = writing_standard.get("summary", "")
+    confidence = item.get("confidence")
+    risk = item.get("risk") or item.get("risk_level") or "low"
+    risk_notes = item.get("risk_notes", "")
+    duplicate_notes = item.get("duplicate_notes", "")
+    priority = item.get("priority", "medium")
+    monitored_source = item.get("monitored_source") if isinstance(item.get("monitored_source"), dict) else {}
+    matched_keywords = item.get("matched_keywords") or monitored_source.get("matched_keywords") or []
+    fingerprint = item.get("generation_fingerprint", "")
+
+    filter_line = f"Filter: {filter_status}"
+    if skipped_reason:
+        filter_line = f"{filter_line} ({skipped_reason})"
+    confidence_line = f"Confidence/risk: {confidence if confidence is not None else 'unknown'} / {risk}"
+    keyword_line = ", ".join(str(k) for k in matched_keywords) if matched_keywords else "none recorded"
 
     content = (
         f"@{account_handle} · {lane} · {', '.join(action_types)}\n\n"
         f"Signal from @{author} [{category}] (score: {score}):\n"
         f'"{tweet_text}"\n\n'
         f"Source: {signal_url}\n\n"
-        f"Rationale: {rationale}\n\n"
+        f"{filter_line}\n"
+        f"Account fit: {account_fit_reason}\n"
+        f"Writing standard: {writing_status} — {writing_summary}\n"
+        f"{confidence_line}\n"
+        f"Matched keywords: {keyword_line}\n\n"
+        f"Rationale: {rationale}\n"
+        f"Risk notes: {risk_notes}\n"
+        f"Duplicate notes: {duplicate_notes}\n\n"
         f"[x-engage/{fingerprint}]"
+    )
+    signal_rationale = (
+        f"Filter: {filter_status}. Account fit: {account_fit_reason}. "
+        f"Writing standard: {writing_status} — {writing_summary}. "
+        f"Source: @{author} score={score}; confidence={confidence if confidence is not None else 'unknown'}; risk={risk}."
     )
     return {
         "platform": "x",
@@ -123,6 +156,22 @@ def _build_social_post_row(item: dict[str, Any], angle: str) -> dict[str, Any]:
         "content": content,
         "status": "draft",
         "created_by": "x-engage-analyzer",
+        "approval_status": "pending",
+        "account_handle": account_handle,
+        "account_label": account_label,
+        "lane": lane,
+        "post_type": ",".join(action_types) if action_types else "engagement",
+        "rationale": account_fit_reason,
+        "signal_rationale": signal_rationale,
+        "monitored_account": author,
+        "monitored_keyword": ", ".join(str(k) for k in matched_keywords),
+        "priority": priority,
+        "risk_level": risk,
+        "duplicate_note": duplicate_notes,
+        "generated_by": "x-engage-analyzer",
+        "generation_model": "account_strategy_filter",
+        "source_url": signal_url,
+        "source_signal_id": source_signal_id,
     }
 
 
@@ -213,7 +262,8 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             to_update.append((existing["id"], {**row_data, "status": "draft"}))
         else:
-            to_update.append((existing["id"], {"content": row_data["content"]}))
+            update_data = {k: v for k, v in row_data.items() if k != "status"}
+            to_update.append((existing["id"], update_data))
 
     created = 0
     refreshed = 0
