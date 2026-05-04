@@ -35,6 +35,12 @@ case "$MODE" in
   analyze-dry-run)
     run_python "$SCRIPT_DIR/analyze.py" --dry-run --skip-llm "$@"
     ;;
+  queue-refill)
+    run_python "$SCRIPT_DIR/queue_refill.py" "$@"
+    ;;
+  queue-refill-server)
+    run_python "$SCRIPT_DIR/queue_refill.py" --serve "$@"
+    ;;
   execute-dry-run)
     run_python "$SCRIPT_DIR/execute_actions.py" --dry-run "$@"
     ;;
@@ -50,7 +56,7 @@ case "$MODE" in
     run_python "$SCRIPT_DIR/execute_actions.py" --dry-run
     ;;
   *)
-    echo "Usage: bash run-engage.sh [analyze|analyze-dry-run|execute-dry-run|execute-live|full-dry-run]" >&2
+    echo "Usage: bash run-engage.sh [analyze|analyze-dry-run|queue-refill|queue-refill-server|execute-dry-run|execute-live|full-dry-run]" >&2
     exit 1
     ;;
 esac
