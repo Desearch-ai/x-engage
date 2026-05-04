@@ -17,7 +17,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1013,30 +1013,89 @@ def write_pending_actions(items: list[dict], output_path: str, run_metadata: dic
 # Main
 # ─────────────────────────────────────────────
 
-def _trigger_context(cfg: dict[str, Any], dry_run: bool, trigger: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+def _parse_requested_at(value: Any | None) -> datetime:
+    if isinstance(value, str) and value.strip():
+        raw = value.strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def _configured_schedule_interval_seconds(cfg: dict[str, Any]) -> int | None:
+    value = cfg.get("engage_check_interval_seconds")
+    if value is None and isinstance(cfg.get("x_engage_runtime"), dict):
+        value = cfg["x_engage_runtime"].get("check_interval_seconds")
+    if value is None and "trigger_interval_hours" in cfg:
+        value = float(cfg.get("trigger_interval_hours", 0)) * 3600
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+def _trigger_context(
+    cfg: dict[str, Any],
+    dry_run: bool,
+    trigger: str | None = None,
+    run_id: str | None = None,
+    review_queue_only: bool = False,
+    request_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     env_trigger = os.environ.get("X_ENGAGE_TRIGGER", "").strip().lower()
     trigger_type = (trigger or env_trigger or ("manual" if dry_run else "scheduled")).strip().lower()
     if trigger_type not in {"manual", "scheduled"}:
         trigger_type = "manual"
+    request_metadata = request_metadata or {}
+    requested_at = _parse_requested_at(request_metadata.get("requested_at"))
     run_identifier = (
         run_id
         or os.environ.get("X_ENGAGE_RUN_ID")
         or os.environ.get("X_ENGAGE_MANUAL_RUN_ID")
-        or f"x-engage-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        or f"x-engage-{trigger_type}-{requested_at.strftime('%Y%m%dT%H%M%SZ')}"
     )
-    return {
+    interval_seconds = _configured_schedule_interval_seconds(cfg)
+    context: dict[str, Any] = {
         "run_id": run_identifier,
         "trigger": trigger_type,
         "dry_run": dry_run,
-        "scheduled_interval_seconds": cfg.get("engage_check_interval_seconds")
-            or int(float(cfg.get("trigger_interval_hours", 4)) * 3600),
+        "service": "x-engage",
+        "owner": "x-engage",
+        "mode": "review_queue_only" if review_queue_only else "analyze_and_report",
+        "allow_live_actions": False,
         "runtime_source": cfg.get("runtime_source", "config_fallback"),
+        "request": request_metadata,
     }
+    if interval_seconds:
+        context["scheduled_interval_seconds"] = interval_seconds
+        context["next_run_at"] = (requested_at + timedelta(seconds=interval_seconds)).isoformat()
+    else:
+        context["schedule_not_configured"] = True
+    return context
 
 
-def run(dry_run: bool = False, skip_llm: bool = False, trigger: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+def run(
+    dry_run: bool = False,
+    skip_llm: bool = False,
+    trigger: str | None = None,
+    run_id: str | None = None,
+    review_queue_only: bool = False,
+    request_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     cfg = load_config()
-    trigger_info = _trigger_context(cfg, dry_run=dry_run, trigger=trigger, run_id=run_id)
+    trigger_info = _trigger_context(
+        cfg,
+        dry_run=dry_run,
+        trigger=trigger,
+        run_id=run_id,
+        review_queue_only=review_queue_only,
+        request_metadata=request_metadata,
+    )
 
     # Load all configured X accounts
     accounts = get_accounts(cfg)
@@ -1178,6 +1237,7 @@ def run(dry_run: bool = False, skip_llm: bool = False, trigger: str | None = Non
             "filter_stage": filter_criteria,
         },
         "selected_signals": selected_signals,
+        "signal_counts": analysis_input_metadata["signal_counts"],
         "filter_summary": filter_summary,
         "filter_decisions": filter_decisions,
         "skipped_filter_decisions": skipped_filter_decisions,
@@ -1227,6 +1287,30 @@ def run(dry_run: bool = False, skip_llm: bool = False, trigger: str | None = Non
     social_os_summary = write_social_os_review_rows(queue_items)
     result["social_os_summary"] = social_os_summary
 
+    if review_queue_only:
+        emit_social_runtime_event(
+            "info",
+            f"Review queue refill completed via {trigger_info['trigger']} trigger",
+            {
+                **trigger_info,
+                "x_monitor_window_path": str(window_path),
+                "signal_counts": analysis_input_metadata["signal_counts"],
+                "selected_signals": selected_signals,
+                "filter_summary": filter_summary,
+                "filter_decisions": filter_decisions,
+                "selected_routed_decisions": queued_filter_decisions,
+                "skipped_filter_decisions": skipped_filter_decisions,
+                "queue_summary": queue_summary,
+                "social_os_summary": social_os_summary,
+            },
+        )
+        print(
+            f"[done] Review queue refill completed: {social_os_summary.get('created', 0)} created, "
+            f"{social_os_summary.get('refreshed', 0)} refreshed, {social_os_summary.get('skipped', 0)} skipped",
+            file=sys.stderr,
+        )
+        return result
+
     # Post digest to Discord
     bot_token = _get_discord_token()
     channel_id = str(cfg["discord_channel_id"])
@@ -1273,10 +1357,21 @@ if __name__ == "__main__":
         default=None,
         help="Optional run identifier propagated into Social OS telemetry",
     )
+    parser.add_argument(
+        "--review-queue-only",
+        action="store_true",
+        help="Generate pending/Social OS review queue rows only; never post Discord or execute live X actions",
+    )
     args = parser.parse_args()
 
     try:
-        run(dry_run=args.dry_run, skip_llm=args.skip_llm, trigger=args.trigger, run_id=args.run_id)
+        run(
+            dry_run=args.dry_run,
+            skip_llm=args.skip_llm,
+            trigger=args.trigger,
+            run_id=args.run_id,
+            review_queue_only=args.review_queue_only,
+        )
         sys.exit(0)
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
