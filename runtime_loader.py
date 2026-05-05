@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any
 
@@ -316,32 +317,108 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+SOCIAL_OS_APPROVED_SELECT = ",".join((
+    "id",
+    "angle",
+    "platform",
+    "post_type",
+    "source_signal_id",
+    "source_url",
+    "account_handle",
+    "account_label",
+    "lane",
+    "approval_status",
+    "approval_url",
+    "approved_by",
+    "status",
+))
+
+
+def _clean_social_str(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _parse_x_status_url(url: str) -> tuple[str, str]:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "", ""
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in {"x.com", "twitter.com", "mobile.twitter.com"}:
+        return "", ""
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if not parts or parts[0].lower() in {"i", "home", "search", "hashtag"}:
+        return "", ""
+    author = parts[0].lstrip("@")
+    tweet_id = ""
+    if len(parts) >= 3 and parts[1].lower() == "status":
+        tweet_id = parts[2]
+    return author, tweet_id
+
+
+def _author_from_x_url(url: str) -> str:
+    return _parse_x_status_url(url)[0]
+
+
+def _tweet_id_from_x_url(url: str) -> str:
+    return _parse_x_status_url(url)[1]
+
+
+def _social_post_author(row: dict[str, Any]) -> str:
+    # monitored_account existed in earlier local/dev schemas. The deployed Social OS schema
+    # does not expose it, so derive the source author from source_url when possible.
+    return (
+        _clean_social_str(row.get("monitored_account")).lstrip("@")
+        or _author_from_x_url(_clean_social_str(row.get("source_url")))
+        or "unknown"
+    )
+
+
+def _is_executable_social_post_row(row: dict[str, Any]) -> bool:
+    tweet_url = _clean_social_str(row.get("source_url"))
+    tweet_id = _clean_social_str(row.get("source_signal_id")) or _tweet_id_from_x_url(tweet_url)
+    return (
+        _clean_social_str(row.get("platform")).lower() == "x"
+        and _clean_social_str(row.get("approval_status")).lower() == "approved"
+        and _clean_social_str(row.get("status")).lower() != "posted"
+        and bool(tweet_url)
+        and bool(tweet_id)
+    )
+
+
 def _social_post_to_action(row: dict[str, Any]) -> dict[str, Any]:
     """Map an approved social_posts row to the action dict format used by execute_actions.py."""
-    angle = row.get("angle", "")
+    angle = _clean_social_str(row.get("angle"))
     # angle format: "x-engage:{signal_id}:{account_id}"
     parts = angle.split(":", 2)
     account_id = parts[2] if len(parts) == 3 else (row.get("account_handle") or "default")
 
-    raw_post_type = (row.get("post_type") or "").strip()
-    action = raw_post_type.split(",")[0].strip() if raw_post_type else "retweet"
+    raw_post_type = _clean_social_str(row.get("post_type"))
+    action = raw_post_type.split(",")[0].strip().lower() if raw_post_type else "retweet"
     if action not in ("retweet", "quote"):
         action = "retweet"
 
+    tweet_url = _clean_social_str(row.get("source_url"))
+    tweet_id = _clean_social_str(row.get("source_signal_id")) or _tweet_id_from_x_url(tweet_url)
+
     return {
-        "tweet_id": row.get("source_signal_id") or "",
-        "tweet_url": row.get("source_url") or "",
-        "author": row.get("monitored_account") or "",
+        "tweet_id": tweet_id,
+        "tweet_url": tweet_url,
+        "author": _social_post_author(row),
         "action": action,
-        "quote_text": row.get("quote_text") or "",
+        # quote_text is not present in the deployed Social OS schema. Keep this safe/empty
+        # instead of reusing review UI content as live publish text.
+        "quote_text": _clean_social_str(row.get("quote_text")),
         "account_id": account_id,
-        "account_handle": row.get("account_handle") or "",
-        "account_label": row.get("account_label") or "",
-        "lane": row.get("lane") or "",
+        "account_handle": _clean_social_str(row.get("account_handle")),
+        "account_label": _clean_social_str(row.get("account_label")),
+        "lane": _clean_social_str(row.get("lane")),
         "status": "approved",
-        "approval_status": row.get("approval_status") or "",
-        "approval_url": row.get("approval_url") or "",
-        "approved_by": row.get("approved_by") or "",
+        "approval_status": _clean_social_str(row.get("approval_status")),
+        "approval_url": _clean_social_str(row.get("approval_url")),
+        "approved_by": _clean_social_str(row.get("approved_by")),
         "social_os_row_id": row.get("id"),
         "_source": "social_os",
     }
@@ -372,9 +449,7 @@ def load_social_os_approved_rows() -> list[dict[str, Any]]:
             f"{url}/rest/v1/social_posts",
             headers=headers,
             params={
-                "select": "id,angle,platform,post_type,source_signal_id,source_url,"
-                          "monitored_account,account_handle,account_label,lane,"
-                          "approval_status,approval_url,approved_by,status,quote_text",
+                "select": SOCIAL_OS_APPROVED_SELECT,
                 "platform": "eq.x",
                 "approval_status": "eq.approved",
                 "status": "neq.posted",
@@ -386,7 +461,8 @@ def load_social_os_approved_rows() -> list[dict[str, Any]]:
         if not isinstance(rows, list):
             print("[social-os] Unexpected response from social_posts query", file=sys.stderr)
             return []
-        actions = [_social_post_to_action(row) for row in rows]
+        executable_rows = [row for row in rows if isinstance(row, dict) and _is_executable_social_post_row(row)]
+        actions = [_social_post_to_action(row) for row in executable_rows]
         print(f"[social-os] Loaded {len(actions)} approved Social OS row(s) for execution", file=sys.stderr)
         return actions
     except Exception as exc:

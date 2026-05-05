@@ -96,6 +96,7 @@ def _sample_social_post_row(**overrides) -> dict:
         "post_type": "retweet",
         "source_signal_id": "tweet-555",
         "source_url": "https://x.com/author/status/555",
+        "content": "Review text for Social OS operator.\n\nSuggested quote text",
         "monitored_account": "author",
         "account_handle": "desearch_ai",
         "account_label": "@desearch_ai",
@@ -130,6 +131,15 @@ def test_social_post_to_action_maps_all_fields():
     assert action["_source"] == "social_os"
 
 
+def test_social_post_to_action_falls_back_to_tweet_id_from_source_url():
+    from runtime_loader import _social_post_to_action
+    row = _sample_social_post_row(source_signal_id="")
+
+    action = _social_post_to_action(row)
+
+    assert action["tweet_id"] == "555"
+
+
 def test_social_post_to_action_extracts_account_from_angle():
     from runtime_loader import _social_post_to_action
     row = _sample_social_post_row(angle="x-engage:tweet-999:personal", account_handle="cosmic_desearch")
@@ -156,6 +166,22 @@ def test_social_post_to_action_unknown_post_type_defaults_to_retweet():
     row = _sample_social_post_row(post_type="like")
     action = _social_post_to_action(row)
     assert action["action"] == "retweet"
+
+
+def test_social_post_to_action_maps_deployed_schema_row_without_optional_author_or_quote():
+    from runtime_loader import _social_post_to_action
+    row = _sample_social_post_row(post_type="quote")
+    row.pop("monitored_account")
+    row.pop("quote_text")
+
+    action = _social_post_to_action(row)
+
+    assert action["author"] == "author"
+    assert action["quote_text"] == ""
+    assert action["social_os_row_id"] == "row-uuid-001"
+    assert action["approval_status"] == "approved"
+    assert action["approval_url"] == "https://mc.desearch.ai/tasks/802"
+    assert action["approved_by"] == "Giga"
 
 
 def test_load_social_os_approved_rows_returns_empty_when_no_env(monkeypatch):
@@ -193,6 +219,85 @@ def test_load_social_os_approved_rows_fetches_and_maps(monkeypatch):
     assert result[0]["_source"] == "social_os"
     assert calls[0]["params"]["approval_status"] == "eq.approved"
     assert calls[0]["params"]["platform"] == "eq.x"
+
+
+def test_load_social_os_approved_rows_uses_deployed_schema_columns(monkeypatch):
+    from runtime_loader import load_social_os_approved_rows
+    import runtime_loader
+
+    deployed_row = _sample_social_post_row()
+    deployed_row.pop("monitored_account")
+    deployed_row.pop("quote_text")
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return [deployed_row]
+
+    calls = []
+    def fake_get(url, headers, params, timeout):
+        calls.append({"url": url, "params": params})
+        return Response()
+
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+    monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+
+    result = load_social_os_approved_rows()
+
+    selected_columns = calls[0]["params"]["select"].split(",")
+    assert "monitored_account" not in selected_columns
+    assert "quote_text" not in selected_columns
+    assert len(result) == 1
+    assert result[0]["author"] == "author"
+
+
+def test_load_social_os_approved_rows_excludes_untrusted_pending_rejected_and_posted_rows(monkeypatch):
+    from runtime_loader import load_social_os_approved_rows
+    import runtime_loader
+
+    rows = [
+        _sample_social_post_row(id="approved-row"),
+        _sample_social_post_row(id="pending-row", approval_status="pending"),
+        _sample_social_post_row(id="rejected-row", approval_status="rejected"),
+        _sample_social_post_row(id="posted-row", status="posted"),
+        _sample_social_post_row(id="wrong-platform-row", platform="linkedin"),
+        _sample_social_post_row(id="missing-source-row", source_url="", source_signal_id=""),
+    ]
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return rows
+
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+    monkeypatch.setattr(runtime_loader.requests, "get", lambda *args, **kwargs: Response())
+
+    result = load_social_os_approved_rows()
+
+    assert [item["social_os_row_id"] for item in result] == ["approved-row"]
+
+
+def test_load_social_os_approved_rows_returns_empty_on_http_query_error(monkeypatch):
+    from runtime_loader import load_social_os_approved_rows
+    import runtime_loader
+    import requests
+
+    class Response:
+        status_code = 400
+        text = '{"message":"column social_posts.monitored_account does not exist"}'
+        def raise_for_status(self):
+            raise requests.HTTPError("400 Client Error: Bad Request")
+        def json(self):
+            raise AssertionError("json should not be read after a query error")
+
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+    monkeypatch.setattr(runtime_loader.requests, "get", lambda *args, **kwargs: Response())
+
+    result = load_social_os_approved_rows()
+    assert result == []
 
 
 def test_load_social_os_approved_rows_returns_empty_on_error(monkeypatch):
