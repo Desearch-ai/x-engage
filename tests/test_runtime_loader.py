@@ -221,6 +221,7 @@ def test_load_social_os_approved_rows_fetches_and_maps(monkeypatch):
     assert result[0]["approved_at"] == "2026-05-09T08:00:00+00:00"
     assert result[0]["_source"] == "social_os"
     assert calls[0]["params"]["approval_status"] == "eq.approved"
+    assert calls[0]["params"]["status"] == "eq.approved"
     assert calls[0]["params"]["platform"] == "eq.x"
 
 
@@ -262,8 +263,10 @@ def test_load_social_os_approved_rows_excludes_untrusted_pending_rejected_and_po
     rows = [
         _sample_social_post_row(id="approved-row"),
         _sample_social_post_row(id="pending-row", approval_status="pending"),
-        _sample_social_post_row(id="rejected-row", approval_status="rejected"),
-        _sample_social_post_row(id="generated-row", status="generated", approval_status="pending"),
+        # Status remains an execution gate even if upstream approval_status is stale/inconsistent.
+        _sample_social_post_row(id="rejected-row", status="rejected", approval_status="approved"),
+        _sample_social_post_row(id="generated-row", status="generated", approval_status="approved"),
+        _sample_social_post_row(id="draft-row", status="draft", approval_status="approved"),
         _sample_social_post_row(id="posted-row", status="posted"),
         _sample_social_post_row(id="wrong-platform-row", platform="linkedin"),
         _sample_social_post_row(id="missing-source-row", source_url="", source_signal_id=""),

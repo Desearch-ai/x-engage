@@ -26,7 +26,7 @@ For any live action (retweet, quote, or original post), the item MUST include:
 ### Approval Validation Flow
 
 ```
-Item enters queue → Check approval_status='approved' + approved_by + (approval_url or approved_at)
+Item enters queue → Check status='approved' + approval_status='approved' + approved_by + (approval_url or approved_at)
                                     ↓
                     ❌ REJECTED         ✅ PROCEED
                     (status =              ↓
@@ -341,7 +341,7 @@ monitor.py                →    analyze.py
                                  ↓ writes pending_actions.json
                                         ↓
                                execute_actions.py (manual trigger, requires MC approval)
-                                 ↓ reads approved items with approval_status='approved'
+                                 ↓ reads items with status='approved' and approval_status='approved'
                                  ↓ RT/Quote via Playwright
                                  ↓ posts confirmations to Discord
 ```

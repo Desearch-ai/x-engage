@@ -511,10 +511,12 @@ def _social_post_author(row: dict[str, Any]) -> str:
 def _is_executable_social_post_row(row: dict[str, Any]) -> bool:
     tweet_url = _clean_social_str(row.get("source_url"))
     tweet_id = _clean_social_str(row.get("source_signal_id")) or _tweet_id_from_x_url(tweet_url)
+    status = _clean_social_str(row.get("status")).lower()
+    approval_status = _clean_social_str(row.get("approval_status")).lower()
     return (
         _clean_social_str(row.get("platform")).lower() == "x"
-        and _clean_social_str(row.get("approval_status")).lower() == "approved"
-        and _clean_social_str(row.get("status")).lower() != "posted"
+        and status == "approved"
+        and approval_status == "approved"
         and bool(tweet_url)
         and bool(tweet_id)
     )
@@ -562,7 +564,7 @@ def load_social_os_approved_rows() -> list[dict[str, Any]]:
     Fetch Social OS social_posts rows with approval_status='approved' for x-engage execution.
 
     Queries the social_posts table for platform='x' rows that have been approved in Social OS
-    and have not yet been posted. Maps each row to the action dict format understood by
+    and are also in status='approved'. Maps each row to the action dict format understood by
     execute_actions.py, preserving approval provenance (approval_url, approved_by).
 
     Returns [] if Supabase is not configured or the query fails (best-effort, non-fatal).
@@ -585,7 +587,7 @@ def load_social_os_approved_rows() -> list[dict[str, Any]]:
                 "select": SOCIAL_OS_APPROVED_SELECT,
                 "platform": "eq.x",
                 "approval_status": "eq.approved",
-                "status": "neq.posted",
+                "status": "eq.approved",
             },
             timeout=10,
         )
