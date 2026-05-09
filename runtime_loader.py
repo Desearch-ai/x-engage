@@ -508,18 +508,36 @@ def _social_post_author(row: dict[str, Any]) -> str:
     )
 
 
-def _is_executable_social_post_row(row: dict[str, Any]) -> bool:
+def _social_post_action(row: dict[str, Any]) -> str:
+    raw_post_type = _clean_social_str(row.get("post_type"))
+    action = raw_post_type.split(",")[0].strip().lower() if raw_post_type else "retweet"
+    return action if action in ("retweet", "quote") else ""
+
+
+def _social_post_executable_blocker(row: dict[str, Any]) -> str | None:
     tweet_url = _clean_social_str(row.get("source_url"))
-    tweet_id = _clean_social_str(row.get("source_signal_id")) or _tweet_id_from_x_url(tweet_url)
+    _author, tweet_id_from_url = _parse_x_status_url(tweet_url)
     status = _clean_social_str(row.get("status")).lower()
     approval_status = _clean_social_str(row.get("approval_status")).lower()
-    return (
-        _clean_social_str(row.get("platform")).lower() == "x"
-        and status == "approved"
-        and approval_status == "approved"
-        and bool(tweet_url)
-        and bool(tweet_id)
-    )
+    action = _social_post_action(row)
+
+    if _clean_social_str(row.get("platform")).lower() != "x":
+        return "platform_not_x"
+    if status != "approved":
+        return f"status_{status or 'missing'}"
+    if approval_status != "approved":
+        return f"approval_status_{approval_status or 'missing'}"
+    if not tweet_url or not tweet_id_from_url:
+        return "source_url_not_x_status"
+    if not action:
+        return "unsupported_post_type"
+    if action == "quote" and not _clean_social_str(row.get("quote_text")):
+        return "quote_text_empty"
+    return None
+
+
+def _is_executable_social_post_row(row: dict[str, Any]) -> bool:
+    return _social_post_executable_blocker(row) is None
 
 
 def _social_post_to_action(row: dict[str, Any]) -> dict[str, Any]:
@@ -529,13 +547,10 @@ def _social_post_to_action(row: dict[str, Any]) -> dict[str, Any]:
     parts = angle.split(":", 2)
     account_id = parts[2] if len(parts) == 3 else (row.get("account_handle") or "default")
 
-    raw_post_type = _clean_social_str(row.get("post_type"))
-    action = raw_post_type.split(",")[0].strip().lower() if raw_post_type else "retweet"
-    if action not in ("retweet", "quote"):
-        action = "retweet"
+    action = _social_post_action(row) or "retweet"
 
     tweet_url = _clean_social_str(row.get("source_url"))
-    tweet_id = _clean_social_str(row.get("source_signal_id")) or _tweet_id_from_x_url(tweet_url)
+    tweet_id = _tweet_id_from_x_url(tweet_url)
 
     return {
         "tweet_id": tweet_id,
@@ -596,7 +611,21 @@ def load_social_os_approved_rows() -> list[dict[str, Any]]:
         if not isinstance(rows, list):
             print("[social-os] Unexpected response from social_posts query", file=sys.stderr)
             return []
-        executable_rows = [row for row in rows if isinstance(row, dict) and _is_executable_social_post_row(row)]
+        executable_rows = []
+        excluded_rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                excluded_rows.append(("unknown", "invalid_row"))
+                continue
+            blocker = _social_post_executable_blocker(row)
+            if blocker:
+                excluded_rows.append((str(row.get("id") or "unknown"), blocker))
+            else:
+                executable_rows.append(row)
+
+        for row_id, blocker in excluded_rows:
+            print(f"[social-os] Excluded approved social_posts row {row_id}: {blocker}", file=sys.stderr)
+
         actions = [_social_post_to_action(row) for row in executable_rows]
         print(f"[social-os] Loaded {len(actions)} approved Social OS row(s) for execution", file=sys.stderr)
         return actions

@@ -117,7 +117,7 @@ def test_social_post_to_action_maps_all_fields():
     row = _sample_social_post_row()
     action = _social_post_to_action(row)
 
-    assert action["tweet_id"] == "tweet-555"
+    assert action["tweet_id"] == "555"
     assert action["tweet_url"] == "https://x.com/author/status/555"
     assert action["author"] == "author"
     assert action["action"] == "retweet"
@@ -186,6 +186,25 @@ def test_social_post_to_action_maps_deployed_schema_row_without_optional_author_
     assert action["approved_by"] == "Giga"
 
 
+def test_is_executable_social_post_row_excludes_empty_quote_text():
+    from runtime_loader import _social_post_executable_blocker, _is_executable_social_post_row
+    row = _sample_social_post_row(id="empty-quote", post_type="quote", quote_text="")
+
+    assert _is_executable_social_post_row(row) is False
+    assert _social_post_executable_blocker(row) == "quote_text_empty"
+
+def test_is_executable_social_post_row_excludes_non_x_status_urls():
+    from runtime_loader import _social_post_executable_blocker, _is_executable_social_post_row
+    row = _sample_social_post_row(
+        id="mc-link",
+        post_type="reply",
+        source_url="http://100.113.216.73:5174/tasks/1431",
+        source_signal_id="task1431-20260509153221-0a949e-approve-cosmic",
+    )
+
+    assert _is_executable_social_post_row(row) is False
+    assert _social_post_executable_blocker(row) == "source_url_not_x_status"
+
 def test_load_social_os_approved_rows_returns_empty_when_no_env(monkeypatch):
     from runtime_loader import load_social_os_approved_rows
     monkeypatch.delenv("SOCIAL_OS_SUPABASE_URL", raising=False)
@@ -216,7 +235,7 @@ def test_load_social_os_approved_rows_fetches_and_maps(monkeypatch):
     result = load_social_os_approved_rows()
 
     assert len(result) == 1
-    assert result[0]["tweet_id"] == "tweet-555"
+    assert result[0]["tweet_id"] == "555"
     assert result[0]["approval_status"] == "approved"
     assert result[0]["approved_at"] == "2026-05-09T08:00:00+00:00"
     assert result[0]["_source"] == "social_os"
@@ -224,6 +243,34 @@ def test_load_social_os_approved_rows_fetches_and_maps(monkeypatch):
     assert calls[0]["params"]["status"] == "eq.approved"
     assert calls[0]["params"]["platform"] == "eq.x"
 
+
+def test_load_social_os_approved_rows_logs_excluded_empty_quote(monkeypatch, capsys):
+    from runtime_loader import load_social_os_approved_rows
+    import runtime_loader
+
+    rows = [
+        _sample_social_post_row(id="ok-retweet"),
+        _sample_social_post_row(id="empty-quote", post_type="quote", quote_text=""),
+    ]
+
+    class Response:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return rows
+
+    def fake_get(url, headers, params, timeout):
+        return Response()
+
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+    monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+
+    result = load_social_os_approved_rows()
+
+    captured = capsys.readouterr()
+    assert len(result) == 1
+    assert result[0]["social_os_row_id"] == "ok-retweet"
+    assert "Excluded approved social_posts row empty-quote: quote_text_empty" in captured.err
 
 def test_load_social_os_approved_rows_uses_deployed_schema_columns(monkeypatch):
     from runtime_loader import load_social_os_approved_rows
