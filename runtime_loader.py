@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -96,6 +97,23 @@ def emit_social_runtime_event(event_type: str, message: str, metadata: dict[str,
 # ─────────────────────────────────────────────
 
 INACTIVE_SOCIAL_STATUSES = {"rejected", "approved", "posted"}
+REGENERATABLE_SOCIAL_STATUSES = {"rejected", "commented", "changes_requested", "revision_requested"}
+SOCIAL_REJECTION_FEEDBACK_FIELDS = (
+    "operator_feedback",
+    "rejection_comment",
+    "rejection_comments",
+    "rejection_reason",
+    "review_notes",
+    "feedback",
+    "comment",
+    "comments",
+)
+SOCIAL_REGENERATION_LINEAGE_FIELDS = (
+    "regenerated_from_post_id",
+    "regenerated_from_id",
+    "parent_post_id",
+    "source_post_id",
+)
 
 
 def _build_social_post_row(item: dict[str, Any], angle: str) -> dict[str, Any]:
@@ -183,6 +201,79 @@ def _extract_social_fingerprint(content: str) -> str:
     return m.group(1) if m else ""
 
 
+def _social_review_state(row: dict[str, Any]) -> str:
+    """Return canonical review state for x-engage's Social OS safety gates."""
+    status = _clean_social_str(row.get("status")).lower()
+    approval_status = _clean_social_str(row.get("approval_status")).lower()
+    if status in REGENERATABLE_SOCIAL_STATUSES:
+        return status
+    return approval_status or status
+
+
+def _social_operator_feedback(row: dict[str, Any]) -> str:
+    """Extract operator reject/comment feedback from supported Social OS handoff fields."""
+    for field in SOCIAL_REJECTION_FEEDBACK_FIELDS:
+        value = row.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict):
+        for field in SOCIAL_REJECTION_FEEDBACK_FIELDS:
+            value = metadata.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
+
+
+def _regeneration_angle(base_angle: str, existing: dict[str, Any], item: dict[str, Any], feedback: str) -> str:
+    """Build a stable per-feedback angle so retrying a refill is idempotent."""
+    seed = json.dumps(
+        {
+            "base_angle": base_angle,
+            "source_row_id": existing.get("id"),
+            "feedback": feedback,
+            "generation_fingerprint": item.get("generation_fingerprint", ""),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+    return f"{base_angle}:regen:{digest}"
+
+
+def _apply_social_regeneration_context(row_data: dict[str, Any], existing: dict[str, Any], feedback: str) -> dict[str, Any]:
+    """Create a pending regenerated review draft using original signal/account/lane context."""
+    source_row_id = _clean_social_str(existing.get("id"))
+    feedback_block = "\n\nOperator feedback for regeneration:\n" + f'"{feedback}"'
+    if source_row_id:
+        feedback_block += f"\nRegenerated from Social OS row: {source_row_id}"
+
+    regenerated = {**row_data}
+    regenerated["content"] = f"{regenerated.get('content', '')}{feedback_block}"
+    regenerated["rationale"] = f"{regenerated.get('rationale', '')} Operator feedback: {feedback}".strip()
+    regenerated["signal_rationale"] = f"{regenerated.get('signal_rationale', '')} Operator feedback: {feedback}".strip()
+    regenerated["approval_status"] = "pending"
+    regenerated["status"] = "draft"
+
+    if source_row_id:
+        for field in SOCIAL_REGENERATION_LINEAGE_FIELDS:
+            if field in existing:
+                regenerated[field] = source_row_id
+
+    if isinstance(existing.get("metadata"), dict):
+        metadata = dict(row_data.get("metadata") or {})
+        metadata.update({
+            "regenerated_from_post_id": source_row_id,
+            "operator_feedback": feedback,
+            "source_angle": existing.get("angle"),
+        })
+        regenerated["metadata"] = metadata
+
+    return regenerated
+
+
 def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
     """
     Upsert Social OS social_posts review rows for queue items.
@@ -191,18 +282,19 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
     - No existing row → INSERT with status='draft'.
     - Existing draft row → UPDATE content (refresh).
     - Existing inactive row (rejected/approved/posted) with same generation fingerprint → SKIP.
-    - Existing inactive row with changed fingerprint → UPDATE to status='draft' with new content.
+    - Existing rejected/commented row with operator feedback → INSERT regenerated pending draft.
+    - Existing inactive row with changed fingerprint and no feedback → UPDATE to status='draft'.
 
     Emits failure telemetry instead of raising on partial write failures.
-    Returns counts: created, refreshed, skipped, total.
+    Returns counts: created, refreshed, skipped, regenerated, total.
     """
     if not items:
-        return {"created": 0, "refreshed": 0, "skipped": 0, "total": 0}
+        return {"created": 0, "refreshed": 0, "skipped": 0, "regenerated": 0, "total": 0}
 
     url, key = _supabase_runtime_env()
     if not url or not key:
         print("[social-os] Supabase env not configured; skipping social_posts write", file=sys.stderr)
-        return {"created": 0, "refreshed": 0, "skipped": 0, "total": 0, "skipped_reason": "no_supabase_env"}
+        return {"created": 0, "refreshed": 0, "skipped": 0, "regenerated": 0, "total": 0, "skipped_reason": "no_supabase_env"}
 
     headers = {
         "apikey": key,
@@ -225,7 +317,7 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
             f"{url}/rest/v1/social_posts",
             headers=headers,
             params={
-                "select": "id,angle,status,content",
+                "select": "*",
                 "platform": "eq.x",
                 "created_by": "eq.x-engage-analyzer",
                 "angle": f"in.({angle_list})",
@@ -234,17 +326,44 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
         )
         resp.raise_for_status()
         existing_by_angle: dict[str, dict[str, Any]] = {row["angle"]: row for row in resp.json()}
+
+        regeneration_angles: list[str] = []
+        for angle, item in angle_map.items():
+            existing = existing_by_angle.get(angle)
+            if not existing:
+                continue
+            feedback = _social_operator_feedback(existing)
+            if _social_review_state(existing) in REGENERATABLE_SOCIAL_STATUSES and feedback:
+                regeneration_angles.append(_regeneration_angle(angle, existing, item, feedback))
+
+        if regeneration_angles:
+            regen_resp = requests.get(
+                f"{url}/rest/v1/social_posts",
+                headers=headers,
+                params={
+                    "select": "id,angle",
+                    "platform": "eq.x",
+                    "created_by": "eq.x-engage-analyzer",
+                    "angle": f"in.({','.join(regeneration_angles)})",
+                },
+                timeout=10,
+            )
+            regen_resp.raise_for_status()
+            for row in regen_resp.json():
+                if isinstance(row, dict) and row.get("angle"):
+                    existing_by_angle[row["angle"]] = row
     except Exception as exc:
         emit_social_runtime_event(
             "error",
             f"social_posts dedup query failed: {exc}",
             {"item_count": len(items)},
         )
-        return {"created": 0, "refreshed": 0, "skipped": 0, "total": 0, "error": str(exc)}
+        return {"created": 0, "refreshed": 0, "skipped": 0, "regenerated": 0, "total": 0, "error": str(exc)}
 
     to_insert: list[dict[str, Any]] = []
     to_update: list[tuple[str, dict[str, Any]]] = []
     skipped = 0
+    regenerated = 0
 
     for angle, item in angle_map.items():
         row_data = _build_social_post_row(item, angle)
@@ -254,8 +373,19 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
             to_insert.append(row_data)
             continue
 
-        existing_status = str(existing.get("status") or "").lower()
-        if existing_status in INACTIVE_SOCIAL_STATUSES:
+        existing_status = _social_review_state(existing)
+        if existing_status in INACTIVE_SOCIAL_STATUSES or existing_status in REGENERATABLE_SOCIAL_STATUSES:
+            feedback = _social_operator_feedback(existing)
+            if existing_status in REGENERATABLE_SOCIAL_STATUSES and feedback:
+                regen_angle = _regeneration_angle(angle, existing, item, feedback)
+                if regen_angle in existing_by_angle:
+                    skipped += 1
+                    continue
+                regenerated_row = _build_social_post_row(item, regen_angle)
+                to_insert.append(_apply_social_regeneration_context(regenerated_row, existing, feedback))
+                regenerated += 1
+                continue
+
             existing_fp = _extract_social_fingerprint(existing.get("content", ""))
             new_fp = item.get("generation_fingerprint", "")
             if existing_fp == new_fp:
@@ -308,10 +438,11 @@ def write_social_os_review_rows(items: list[dict[str, Any]]) -> dict[str, Any]:
         "created": created,
         "refreshed": refreshed,
         "skipped": skipped,
+        "regenerated": regenerated,
         "total": created + refreshed + skipped,
     }
     print(
-        f"[social-os] Review rows: {created} created, {refreshed} refreshed, {skipped} skipped",
+        f"[social-os] Review rows: {created} created, {refreshed} refreshed, {skipped} skipped, {regenerated} regenerated",
         file=sys.stderr,
     )
     return summary
@@ -330,6 +461,7 @@ SOCIAL_OS_APPROVED_SELECT = ",".join((
     "approval_status",
     "approval_url",
     "approved_by",
+    "approved_at",
     "status",
 ))
 
@@ -419,6 +551,7 @@ def _social_post_to_action(row: dict[str, Any]) -> dict[str, Any]:
         "approval_status": _clean_social_str(row.get("approval_status")),
         "approval_url": _clean_social_str(row.get("approval_url")),
         "approved_by": _clean_social_str(row.get("approved_by")),
+        "approved_at": _clean_social_str(row.get("approved_at")),
         "social_os_row_id": row.get("id"),
         "_source": "social_os",
     }

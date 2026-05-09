@@ -104,6 +104,7 @@ def _sample_social_post_row(**overrides) -> dict:
         "approval_status": "approved",
         "approval_url": "https://mc.desearch.ai/tasks/802",
         "approved_by": "Giga",
+        "approved_at": "2026-05-09T08:00:00+00:00",
         "status": "approved",
         "quote_text": None,
     }
@@ -127,6 +128,7 @@ def test_social_post_to_action_maps_all_fields():
     assert action["approval_status"] == "approved"
     assert action["approval_url"] == "https://mc.desearch.ai/tasks/802"
     assert action["approved_by"] == "Giga"
+    assert action["approved_at"] == "2026-05-09T08:00:00+00:00"
     assert action["social_os_row_id"] == "row-uuid-001"
     assert action["_source"] == "social_os"
 
@@ -216,6 +218,7 @@ def test_load_social_os_approved_rows_fetches_and_maps(monkeypatch):
     assert len(result) == 1
     assert result[0]["tweet_id"] == "tweet-555"
     assert result[0]["approval_status"] == "approved"
+    assert result[0]["approved_at"] == "2026-05-09T08:00:00+00:00"
     assert result[0]["_source"] == "social_os"
     assert calls[0]["params"]["approval_status"] == "eq.approved"
     assert calls[0]["params"]["platform"] == "eq.x"
@@ -260,6 +263,7 @@ def test_load_social_os_approved_rows_excludes_untrusted_pending_rejected_and_po
         _sample_social_post_row(id="approved-row"),
         _sample_social_post_row(id="pending-row", approval_status="pending"),
         _sample_social_post_row(id="rejected-row", approval_status="rejected"),
+        _sample_social_post_row(id="generated-row", status="generated", approval_status="pending"),
         _sample_social_post_row(id="posted-row", status="posted"),
         _sample_social_post_row(id="wrong-platform-row", platform="linkedin"),
         _sample_social_post_row(id="missing-source-row", source_url="", source_signal_id=""),

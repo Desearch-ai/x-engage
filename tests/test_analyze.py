@@ -627,6 +627,104 @@ class TestSocialOSReviewRows:
         assert "status" not in patch_calls[0]["json"]
         assert "content" in patch_calls[0]["json"]
 
+
+    def test_rejected_row_with_operator_feedback_regenerates_pending_review_draft(self, monkeypatch):
+        """Rejected/commented Social OS feedback creates a new pending review draft with lineage."""
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+
+        items = self._queue_items()
+        item = items[0]
+        base_angle = f"x-engage:tweet_001:{item['account_id']}"
+        rejected_row = {
+            "id": "row-rejected-1",
+            "angle": base_angle,
+            "status": "rejected",
+            "approval_status": "rejected",
+            "content": f"old review text [x-engage/{item['generation_fingerprint']}]",
+            "rejection_reason": "Too generic — make it more technical and mention validator relevance.",
+            "regenerated_from_post_id": None,
+            "metadata": {},
+        }
+
+        get_calls = []
+        post_calls = []
+        patch_calls = []
+
+        def fake_get(url, headers, params, timeout):
+            get_calls.append(params)
+            if len(get_calls) == 1:
+                return _make_response(200, [rejected_row])
+            return _make_response(200, [])
+
+        def fake_post(url, headers, json, timeout):
+            post_calls.append(json)
+            return _make_response(201)
+
+        def fake_patch(url, headers, params, json, timeout):
+            patch_calls.append({"params": params, "json": json})
+            return _make_response(200)
+
+        monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+        monkeypatch.setattr(runtime_loader.requests, "post", fake_post)
+        monkeypatch.setattr(runtime_loader.requests, "patch", fake_patch)
+
+        summary = write_social_os_review_rows(items)
+
+        assert summary["created"] == 1
+        assert summary["regenerated"] == 1
+        assert summary["refreshed"] == 0
+        assert summary["skipped"] == 0
+        assert len(post_calls) == 1
+        assert not patch_calls
+
+        regenerated = post_calls[0][0]
+        assert regenerated["status"] == "draft"
+        assert regenerated["approval_status"] == "pending"
+        assert regenerated["angle"].startswith(f"{base_angle}:regen:")
+        assert regenerated["source_signal_id"] == "tweet_001"
+        assert regenerated["account_handle"] == item["account_handle"]
+        assert regenerated["lane"] == item["lane"]
+        assert "Operator feedback" in regenerated["content"]
+        assert "Too generic" in regenerated["content"]
+        assert regenerated["regenerated_from_post_id"] == "row-rejected-1"
+        assert regenerated["metadata"]["regenerated_from_post_id"] == "row-rejected-1"
+        assert regenerated["metadata"]["operator_feedback"] == rejected_row["rejection_reason"]
+
+    def test_rejected_feedback_regeneration_is_idempotent(self, monkeypatch):
+        """Retrying the same rejected/commented row does not create duplicate regen drafts."""
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SOCIAL_OS_SUPABASE_KEY", "service-key")
+
+        items = self._queue_items()
+        item = items[0]
+        base_angle = f"x-engage:tweet_001:{item['account_id']}"
+        rejected_row = {
+            "id": "row-rejected-1",
+            "angle": base_angle,
+            "status": "commented",
+            "approval_status": "pending",
+            "content": f"old review text [x-engage/{item['generation_fingerprint']}]",
+            "review_notes": "Rewrite with sharper founder voice.",
+        }
+
+        def fake_get(url, headers, params, timeout):
+            if params["angle"].startswith(f"in.({base_angle}:regen:"):
+                existing_regen_angle = params["angle"][4:-1]
+                return _make_response(200, [{"id": "row-regen-1", "angle": existing_regen_angle}])
+            return _make_response(200, [rejected_row])
+
+        post_calls = []
+        monkeypatch.setattr(runtime_loader.requests, "get", fake_get)
+        monkeypatch.setattr(runtime_loader.requests, "post", lambda *a, **kw: post_calls.append(True) or _make_response(201))
+
+        summary = write_social_os_review_rows(items)
+
+        assert summary["created"] == 0
+        assert summary["regenerated"] == 0
+        assert summary["skipped"] == 1
+        assert not post_calls
+
     def test_returns_zero_counts_when_no_supabase_env(self, monkeypatch):
         """Gracefully no-ops when Supabase credentials are absent."""
         monkeypatch.delenv("SOCIAL_OS_SUPABASE_URL", raising=False)

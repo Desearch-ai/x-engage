@@ -19,13 +19,14 @@ For any live action (retweet, quote, or original post), the item MUST include:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `approval_status` | ✅ Yes | Must be exactly `"approved"` (case-insensitive) |
-| `approval_url` | ✅ Yes | URL to the MC approval message/link (audit trail) |
-| `approved_by` | Recommended | Who approved (for audit completeness) |
+| `approval_url` | Conditional | URL to the MC approval message/link (required when `approved_at` is not present) |
+| `approved_by` | ✅ Yes | Who approved (operator audit trail) |
+| `approved_at` | Conditional | Required when `approval_url` is not present |
 
 ### Approval Validation Flow
 
 ```
-Item enters queue → Check approval_status='approved' + approval_url exists
+Item enters queue → Check approval_status='approved' + approved_by + (approval_url or approved_at)
                                     ↓
                     ❌ REJECTED         ✅ PROCEED
                     (status =              ↓
@@ -264,14 +265,15 @@ Each entry represents one **tweet × account** pair. The same tweet appears once
   "category":       "ai",
   "timestamp":      "2026-...",
   "approval_status": "approved",        // REQUIRED for live execution
-  "approval_url":    "https://discord.com/...",  // REQUIRED for live execution
-  "approved_by":     "Giga"             // recommended for audit
+  "approval_url":    "https://discord.com/...",  // REQUIRED unless approved_at is present
+  "approved_by":     "Giga",            // REQUIRED for audit
+  "approved_at":     "2026-..."         // REQUIRED unless approval_url is present
 }]
 ```
 
 Deduplication key is `(tweet_id, account_id)` — re-running `analyze.py` never adds duplicates.
 
-Set `action=retweet` or `action=quote` + `status=approved` + `approval_status=approved` + `approval_url=<MC approval URL>` to queue for execution.
+Set `action=retweet` or `action=quote` + `status=approved` + `approval_status=approved` + `approved_by=<operator>` + (`approval_url=<MC approval URL>` or `approved_at=<timestamp>`) to queue for execution.
 After `execute_actions.py` runs, `status` becomes `done` (or `failed` with an `error` field).
 
 ---

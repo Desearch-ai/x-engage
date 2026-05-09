@@ -46,6 +46,7 @@ class TestValidateActionApproval:
             "approval_status": "approved",
             "approval_url": "https://discord.com/channels/.../1234567890",
             "approved_by": "Giga",
+            "approved_at": "2026-05-09T08:00:00+00:00",
         }
         is_valid, reason = validate_action_approval(item)
         assert is_valid is True
@@ -71,21 +72,33 @@ class TestValidateActionApproval:
         assert is_valid is False
         assert "pending" in reason
 
-    def test_missing_approval_url(self):
-        """Rejects when approval_url is missing (no provenance)."""
+    def test_missing_approval_provenance_fails(self):
+        """Rejects when both approval_url and approved_at are missing."""
         item = {
             "approval_status": "approved",
-            # approval_url missing
+            "approved_by": "Giga",
         }
         is_valid, reason = validate_action_approval(item)
         assert is_valid is False
-        assert "missing approval_url" in reason
+        assert "missing approval_url or approved_at" in reason
+
+    def test_approved_at_can_satisfy_approval_provenance(self):
+        """Social OS rows may carry approved_at instead of an approval URL."""
+        item = {
+            "approval_status": "approved",
+            "approved_by": "Giga",
+            "approved_at": "2026-05-09T08:00:00+00:00",
+        }
+        is_valid, reason = validate_action_approval(item)
+        assert is_valid is True
+        assert "approved_at" in reason
 
     def test_approval_status_case_insensitive(self):
         """Accepts 'Approved' (uppercase) as valid."""
         item = {
             "approval_status": "Approved",
             "approval_url": "https://discord.com/channels/.../1234567890",
+            "approved_by": "Giga",
         }
         is_valid, reason = validate_action_approval(item)
         assert is_valid is True
@@ -99,15 +112,16 @@ class TestValidateActionApproval:
         is_valid, reason = validate_action_approval(item)
         assert is_valid is False
 
-    def test_approved_by_optional(self):
-        """approved_by is optional but warns if missing."""
+    def test_missing_approved_by_fails(self):
+        """approved_by is required so live actions keep operator provenance."""
         item = {
             "approval_status": "approved",
             "approval_url": "https://discord.com/channels/.../1234567890",
             # approved_by missing
         }
         is_valid, reason = validate_action_approval(item)
-        assert is_valid is True  # Should still pass
+        assert is_valid is False
+        assert "missing approved_by" in reason
 
 
 # ── get_browser_profile ───────────────────────────────────────────────────────
@@ -261,6 +275,7 @@ class TestSocialOSExecutorPath:
             "approval_status": "approved",
             "approval_url": "https://mc.desearch.ai/tasks/802",
             "approved_by": "Giga",
+            "approved_at": "2026-05-09T08:00:00+00:00",
             "social_os_row_id": "uuid-abc-123",
             "_source": "social_os",
         }
@@ -273,11 +288,11 @@ class TestSocialOSExecutorPath:
         assert is_valid is True
         assert "Giga" in reason
 
-    def test_social_os_row_missing_approval_url_fails(self):
+    def test_social_os_row_missing_approval_url_uses_approved_at(self):
         item = self._make_social_os_action(approval_url="")
         is_valid, reason = validate_action_approval(item)
-        assert is_valid is False
-        assert "missing approval_url" in reason
+        assert is_valid is True
+        assert "approved_at" in reason
 
     def test_social_os_row_pending_approval_status_fails(self):
         item = self._make_social_os_action(approval_status="pending")
@@ -301,6 +316,8 @@ class TestSocialOSExecutorPath:
     def test_get_approved_excludes_non_approved_social_os_rows(self):
         items = [
             self._make_social_os_action(status="draft"),
+            self._make_social_os_action(status="rejected", approval_status="rejected"),
+            self._make_social_os_action(status="generated", approval_status="pending"),
             self._make_social_os_action(status="approved"),
         ]
         assert len(get_approved(items)) == 1
@@ -321,6 +338,7 @@ class TestSocialOSExecutorPath:
                 "status": "approved",
                 "approval_status": "approved",
                 "approval_url": "https://mc.desearch.ai/tasks/1",
+                "approved_by": "Giga",
             }
         ]
         save_actions(actions)

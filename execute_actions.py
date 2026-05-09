@@ -18,7 +18,8 @@ APPROVAL CONTRACT:
 - Required fields (both sources):
   - status: "approved"
   - approval_status: "approved" (explicit, not implied)
-  - approval_url: URL of approval (provenance for audit)
+  - approved_by: operator who approved the action
+  - approval_url or approved_at: approval provenance for audit
 - Posts lacking approval_status='approved' are rejected at the door
 
 Schema expected (pending_actions.json and Social OS mapped rows share this shape):
@@ -31,8 +32,9 @@ Schema expected (pending_actions.json and Social OS mapped rows share this shape
   "account_id":       "...",
   "status":           "approved",
   "approval_status":  "approved",     # REQUIRED for live execution
-  "approval_url":     "...",          # REQUIRED for live execution
-  "approved_by":      "...",          # recommended for audit
+  "approval_url":     "...",          # REQUIRED unless approved_at is present
+  "approved_by":      "...",          # REQUIRED for audit
+  "approved_at":      "...",          # REQUIRED unless approval_url is present
   "social_os_row_id": "...",          # present for Social OS source rows
   "_source":          "social_os" | "pending_actions"
 }
@@ -111,15 +113,16 @@ def validate_action_approval(item: dict) -> tuple[bool, str]:
     Validate that an action item has explicit Mission Control approval.
     
     Required for LIVE execution:
-    - approval_status must be "approved" (exact string match)
-    - approval_url must be present (provenance link)
-    - approved_by is recommended but optional
+    - approval_status must be "approved" (case-insensitive)
+    - approved_by must be present (operator provenance)
+    - approval_url or approved_at must be present (approval provenance)
     
     Returns (is_valid, reason_string).
     """
     approval_status = item.get("approval_status", "").strip().lower() if item.get("approval_status") else ""
     approval_url = item.get("approval_url", "").strip()
     approved_by = item.get("approved_by", "").strip()
+    approved_at = item.get("approved_at", "").strip()
     
     if not approval_status:
         return False, "missing approval_status - live execution requires explicit MC per-post approval"
@@ -127,13 +130,19 @@ def validate_action_approval(item: dict) -> tuple[bool, str]:
     if approval_status != "approved":
         return False, f"approval_status is '{approval_status}', not 'approved' - live execution blocked"
     
-    if not approval_url:
-        return False, "missing approval_url - cannot verify approval provenance for audit"
-    
     if not approved_by:
-        print(f"  [warn] approved_by not set - audit trail will be incomplete", file=sys.stderr)
-    
-    return True, f"approved by {approved_by or 'unknown'} (URL: {approval_url})"
+        return False, "missing approved_by - cannot verify operator approval provenance for audit"
+
+    if not approval_url and not approved_at:
+        return False, "missing approval_url or approved_at - cannot verify approval provenance for audit"
+
+    provenance = []
+    if approval_url:
+        provenance.append(f"URL: {approval_url}")
+    if approved_at:
+        provenance.append(f"approved_at: {approved_at}")
+
+    return True, f"approved by {approved_by} ({'; '.join(provenance)})"
 
 
 # ─────────────────────────────────────────────
@@ -197,6 +206,7 @@ def build_execution_event_metadata(
             "approval_status": item.get("approval_status"),
             "approval_url": item.get("approval_url"),
             "approved_by": item.get("approved_by"),
+            "approved_at": item.get("approved_at"),
         },
     }
     if error:
@@ -445,7 +455,7 @@ async def run_executor(dry_run: bool = False) -> int:
     - Primary: Social OS approved rows loaded via load_social_os_approved_rows().
     - Fallback: pending_actions.json, used when Social OS is not configured or has no rows.
 
-    CRITICAL: Validates explicit MC approval (approval_status='approved' + approval_url)
+    CRITICAL: Validates explicit MC approval (approval_status='approved' + operator/provenance fields)
     before any live execution. Items without valid approval are rejected at the door.
     """
     try:
