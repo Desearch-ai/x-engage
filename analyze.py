@@ -231,6 +231,102 @@ def _matched_terms(blob: str, terms: list[str]) -> list[str]:
     return [term for term in terms if term.lower() in blob]
 
 
+def _monitor_route_lanes(tweet: dict[str, Any]) -> list[str]:
+    """Return x-monitor supplied lane hints that are safe to consume as routing evidence."""
+    lanes: list[str] = []
+
+    raw_lanes = tweet.get("_monitor_lanes")
+    if isinstance(raw_lanes, list):
+        lanes.extend(str(lane).strip().lower() for lane in raw_lanes if str(lane).strip())
+
+    raw_hints = tweet.get("_monitor_route_hints")
+    if isinstance(raw_hints, list):
+        for hint in raw_hints:
+            hint_text = str(hint or "").strip().lower()
+            if not hint_text:
+                continue
+            if "/" in hint_text:
+                hint_text = hint_text.rsplit("/", 1)[-1]
+            lanes.append(hint_text)
+
+    normalized: list[str] = []
+    for lane in lanes:
+        canonical = ACCOUNT_FILTER_ALIASES.get(lane, lane)
+        # Keep both the raw lane and canonical account-key alias so account/lane matching is stable.
+        for value in (lane, canonical):
+            if value and value not in normalized:
+                normalized.append(value)
+    return normalized
+
+
+def _monitor_route_matches_account(tweet: dict[str, Any], account: dict[str, Any]) -> list[str]:
+    """Match x-monitor lane/route hints to the target x-engage account without bypassing negatives."""
+    route_lanes = _monitor_route_lanes(tweet)
+    if not route_lanes:
+        return []
+
+    account_keys = set(_account_keys(account))
+    account_keys.add(_canonical_account_key(account))
+    account_lane = str(account.get("lane") or "").strip().lower()
+    if account_lane:
+        account_keys.add(account_lane)
+        account_keys.add(ACCOUNT_FILTER_ALIASES.get(account_lane, account_lane))
+
+    matches = [lane for lane in route_lanes if lane in account_keys]
+    return matches
+
+
+def _confidence_for_monitor_route(score: float, route_matches: list[str]) -> float:
+    if not route_matches:
+        return 0.0
+    engagement_score = min(max(float(score or 0), 0.0) / 5000.0, 0.18)
+    route_score = min(0.2, 0.1 * len(route_matches))
+    return round(min(0.9, 0.54 + route_score + engagement_score), 2)
+
+
+def _refill_noop_policy(
+    queue_items: list[dict[str, Any]],
+    filter_summary: dict[str, Any],
+    skipped_filter_decisions: list[dict[str, Any]],
+    social_os_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Classify a zero-write refill as policy-valid no-op vs config/data gap."""
+    skipped_by_reason = dict(filter_summary.get("skipped_by_reason") or {})
+    selected = int(filter_summary.get("selected") or 0)
+    queued = len(queue_items)
+    social_os_summary = social_os_summary or {}
+    social_writes = (
+        int(social_os_summary.get("created") or 0)
+        + int(social_os_summary.get("refreshed") or 0)
+        + int(social_os_summary.get("regenerated") or 0)
+    )
+
+    if queued == 0 and selected == 0:
+        return {
+            "status": "policy_valid_noop",
+            "policy_valid": True,
+            "reason": "No approval-ready rows were generated because every selected signal failed deterministic account routing/filter criteria.",
+            "skipped_by_reason": skipped_by_reason,
+            "sample_skips": skipped_filter_decisions[:5],
+        }
+
+    if queued > 0 and social_writes == 0:
+        reason = social_os_summary.get("skipped_reason") or social_os_summary.get("error") or "social_os_write_zero"
+        return {
+            "status": "config_or_write_gap",
+            "policy_valid": False,
+            "reason": f"{queued} routed queue item(s) existed, but Social OS wrote zero approval-ready rows: {reason}.",
+            "skipped_by_reason": skipped_by_reason,
+        }
+
+    return {
+        "status": "approval_ready_rows_available",
+        "policy_valid": True,
+        "reason": f"{social_writes} Social OS approval-ready row(s) created/refreshed/regenerated.",
+        "skipped_by_reason": skipped_by_reason,
+    }
+
+
 def _source_signal(tweet: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": _signal_id(tweet),
@@ -302,15 +398,23 @@ def qualify_and_route_signals(
 
             positive_matches = _matched_terms(blob, filters["positive"])
             secondary_matches = _matched_terms(blob, filters["secondary"])
-            if not positive_matches:
+            route_matches = _monitor_route_matches_account(tweet, account)
+            route_evidence = [f"x-monitor-route:{match}" for match in route_matches]
+
+            if positive_matches:
+                confidence = _confidence_for_match(score, positive_matches, secondary_matches)
+                route_bonus = 0.04 if route_matches else 0.0
+                confidence = round(min(0.95, confidence + route_bonus), 2)
+            elif route_matches:
+                confidence = _confidence_for_monitor_route(score, route_matches)
+            else:
                 continue
 
-            confidence = _confidence_for_match(score, positive_matches, secondary_matches)
             if confidence < filters["min_confidence"]:
                 continue
 
             account_handle = account.get("handle") or account.get("id")
-            account_fit_score = (len(positive_matches) * 10) + (len(secondary_matches) * 3) + min(score / 1000.0, 5)
+            account_fit_score = (len(positive_matches) * 10) + (len(route_matches) * 8) + (len(secondary_matches) * 3) + min(score / 1000.0, 5)
             candidates.append({
                 "account": account,
                 "filters": filters,
@@ -319,6 +423,8 @@ def qualify_and_route_signals(
                 "selected_lane": account.get("lane", "unknown"),
                 "positive_matches": positive_matches,
                 "secondary_matches": secondary_matches,
+                "route_matches": route_matches,
+                "route_evidence": route_evidence,
                 "confidence": confidence,
                 "risk": _risk_for_decision(confidence, score),
                 "account_fit_score": round(account_fit_score, 2),
@@ -330,11 +436,21 @@ def qualify_and_route_signals(
             account = chosen["account"]
             filters = chosen["filters"]
             handle = chosen["selected_account"]
-            keyword_list = chosen["positive_matches"] + chosen["secondary_matches"]
-            account_fit_reason = (
-                f"Routed to @{handle} ({account.get('lane', 'unknown')} lane) because the signal matched "
-                f"account strategy keyword(s): {', '.join(keyword_list)}."
-            )
+            keyword_list = chosen["positive_matches"] + chosen["secondary_matches"] + chosen.get("route_evidence", [])
+            if chosen["positive_matches"]:
+                account_fit_reason = (
+                    f"Routed to @{handle} ({account.get('lane', 'unknown')} lane) because the signal matched "
+                    f"account strategy keyword(s): {', '.join(chosen['positive_matches'] + chosen['secondary_matches'])}"
+                )
+                if chosen.get("route_evidence"):
+                    account_fit_reason += f" plus x-monitor route hint(s): {', '.join(chosen['route_evidence'])}."
+                else:
+                    account_fit_reason += "."
+            else:
+                account_fit_reason = (
+                    f"Routed to @{handle} ({account.get('lane', 'unknown')} lane) because x-monitor supplied "
+                    f"policy route hint(s): {', '.join(chosen.get('route_evidence', []))}."
+                )
             decisions.append({
                 "selected": True,
                 "selected_account": handle,
@@ -355,7 +471,8 @@ def qualify_and_route_signals(
                         "lane": c["selected_lane"],
                         "score": c["account_fit_score"],
                         "confidence": c["confidence"],
-                        "matched_keywords": c["positive_matches"] + c["secondary_matches"],
+                        "matched_keywords": c["positive_matches"] + c["secondary_matches"] + c.get("route_evidence", []),
+                        "route_matches": c.get("route_matches", []),
                     }
                     for c in candidates
                 ],
@@ -1286,6 +1403,9 @@ def run(
 
     social_os_summary = write_social_os_review_rows(queue_items)
     result["social_os_summary"] = social_os_summary
+    refill_outcome = _refill_noop_policy(queue_items, filter_summary, skipped_filter_decisions, social_os_summary)
+    result["refill_outcome"] = refill_outcome
+    result["policy_valid_noop"] = refill_outcome if refill_outcome.get("status") == "policy_valid_noop" else None
 
     if review_queue_only:
         emit_social_runtime_event(
@@ -1302,6 +1422,7 @@ def run(
                 "skipped_filter_decisions": skipped_filter_decisions,
                 "queue_summary": queue_summary,
                 "social_os_summary": social_os_summary,
+                "refill_outcome": refill_outcome,
             },
         )
         print(

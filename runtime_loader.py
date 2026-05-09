@@ -715,7 +715,9 @@ def _supabase_runtime_env() -> tuple[str, str] | tuple[None, None]:
         os.environ.get("SOCIAL_OS_SUPABASE_KEY")
         or os.environ.get("SOCIAL_OS_SUPABASE_ANON_KEY")
         or os.environ.get("SUPABASE_ANON_KEY")
+        or os.environ.get("SUPABASE_KEY")
         or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        or os.environ.get("VITE_SUPABASE_SERVICE_KEY")
         or os.environ.get("VITE_SUPABASE_ANON_KEY")
     )
     if url and key:

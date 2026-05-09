@@ -272,6 +272,51 @@ class TestQualificationAndRouting:
         assert summary["selected_by_lane"] == {"research": 1}
         assert summary["skipped_by_reason"] == {"no_account_strategy_match": 1}
 
+    def test_x_monitor_route_hints_create_policy_routing_evidence(self):
+        routed_signal = {
+            **TWEET_A,
+            "id": "monitor-routed-founder",
+            "text": "The more skills you give codex, the less you have to prompt.",
+            "_score": 5024.55,
+            "_monitor_category": "openclaw",
+            "_monitor_lanes": ["founder"],
+            "_monitor_route_hints": ["x-engage/founder"],
+            "_monitor_skipped_reason": "",
+        }
+
+        accounts = [
+            {
+                "id": "personal",
+                "handle": "cosmicquantum",
+                "label": "@cosmicquantum",
+                "lane": "founder",
+                "action_types": ["quote"],
+            }
+        ]
+        decisions = qualify_and_route_signals([routed_signal], accounts)
+
+        assert len(decisions) == 1
+        decision = decisions[0]
+        assert decision["selected"] is True
+        assert decision["selected_account"] == "cosmicquantum"
+        assert "x-monitor-route:founder" in decision["matched_keywords"]
+        assert "x-monitor supplied policy route hint" in decision["account_fit_reason"]
+
+    def test_negative_filters_still_override_x_monitor_route_hints(self):
+        risky_routed_signal = {
+            **TWEET_A,
+            "id": "monitor-routed-risky",
+            "text": "Bittensor price prediction: buy now before this pumps",
+            "_score": 5024.55,
+            "_monitor_lanes": ["brand"],
+            "_monitor_route_hints": ["x-engage/brand"],
+        }
+
+        decisions = qualify_and_route_signals([risky_routed_signal], self._accounts())
+
+        assert decisions[0]["selected"] is False
+        assert decisions[0]["skipped_reason"] == "negative_filter_match"
+
 # ── write_pending_actions ────────────────────────────────────────────────────
 
 class TestWritePendingActions:
