@@ -48,6 +48,7 @@ def test_refill_request_runs_review_queue_only_and_normalizes_response(monkeypat
             "queue_summary": {"created": 2, "refreshed": 1, "skipped": 0},
             "social_os_summary": {"created": 1, "refreshed": 1, "skipped": 0, "total": 2},
             "filter_summary": {"selected": 2, "skipped": 3},
+            "refill_outcome": {"status": "approval_ready_rows_available", "policy_valid": True},
         }
 
     monkeypatch.setattr(queue_refill.analyze, "run", fake_run)
@@ -61,6 +62,9 @@ def test_refill_request_runs_review_queue_only_and_normalizes_response(monkeypat
     assert response["skipped"] == 0
     assert response["run_id"] == "social-os-run-1"
     assert response["next_run_at"] == "2026-05-04T11:49:00+00:00"
+    assert response["queue_total"] == 0
+    assert response["refill_outcome"] == {"status": "approval_ready_rows_available", "policy_valid": True}
+    assert response["policy_valid_noop"] is None
     assert calls == [{
         "dry_run": False,
         "skip_llm": True,
@@ -96,6 +100,31 @@ def test_refill_request_generates_stable_run_id_when_missing(monkeypatch):
     assert first["run_id"] == second["run_id"]
     assert first["run_id"].startswith("x-engage-manual-20260504T074900")
     assert run_ids == [first["run_id"], second["run_id"]]
+
+def test_refill_request_surfaces_policy_valid_noop(monkeypatch):
+    def fake_run(**kwargs):
+        return {
+            "trigger": {"run_id": kwargs["run_id"], "trigger": kwargs["trigger"]},
+            "queue_summary": {"created": 0, "refreshed": 0, "skipped": 0, "total": 0},
+            "social_os_summary": {"created": 0, "refreshed": 0, "skipped": 0, "total": 0},
+            "filter_summary": {"selected": 0, "skipped": 10, "skipped_by_reason": {"no_account_strategy_match": 10}},
+            "refill_outcome": {
+                "status": "policy_valid_noop",
+                "policy_valid": True,
+                "reason": "No approval-ready rows were generated because every selected signal failed deterministic account routing/filter criteria.",
+                "skipped_by_reason": {"no_account_strategy_match": 10},
+            },
+        }
+
+    monkeypatch.setattr(queue_refill.analyze, "run", fake_run)
+
+    response = queue_refill.handle_refill_request(_refill_payload(run_id="noop-run"))
+
+    assert response["ok"] is True
+    assert response["created"] == 0
+    assert response["queue_total"] == 0
+    assert response["refill_outcome"]["status"] == "policy_valid_noop"
+    assert response["policy_valid_noop"]["policy_valid"] is True
 
 def test_refill_request_reports_schedule_not_configured(monkeypatch):
     def fake_run(**kwargs):

@@ -84,6 +84,7 @@ def _normalize_response(result: dict[str, Any], run_id: str) -> dict[str, Any]:
     created = int(social_summary.get("created") or 0)
     refreshed = int(social_summary.get("refreshed") or 0)
     skipped = int(social_summary.get("skipped") or 0)
+    refill_outcome = result.get("refill_outcome") or {}
     response = _json_response(
         True,
         "accepted",
@@ -99,7 +100,10 @@ def _normalize_response(result: dict[str, Any], run_id: str) -> dict[str, Any]:
         mode=REQUIRED_MODE,
         allow_live_actions=False,
         queue_summary=queue_summary,
+        queue_total=int(queue_summary.get("total") or 0),
         social_os_summary=social_summary,
+        refill_outcome=refill_outcome,
+        policy_valid_noop=refill_outcome if refill_outcome.get("status") == "policy_valid_noop" else None,
         signal_counts=(result.get("trigger") or {}).get("signal_counts") or result.get("signal_counts"),
         filter_summary=result.get("filter_summary"),
     )
