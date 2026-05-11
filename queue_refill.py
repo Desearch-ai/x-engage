@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Social OS → x-engage review queue refill contract.
+"""Social OS → Socialos runtime review queue refill contract.
 
 This module is intentionally review-queue-only. It calls analyze.run() with
-review_queue_only=True so x-engage owns x-monitor window loading, filtering,
+review_queue_only=True so the Socialos runtime owns source loading, filtering,
 routing, pending queue generation, Social OS review-row writes, and telemetry.
 It never imports or invokes execute_actions.py, Playwright, or live X actions.
 """
@@ -88,15 +88,15 @@ def _normalize_response(result: dict[str, Any], run_id: str) -> dict[str, Any]:
     response = _json_response(
         True,
         "accepted",
-        f"x-engage review queue refill accepted: {created} created, {refreshed} refreshed, {skipped} skipped.",
+        f"Socialos runtime review queue refill accepted: {created} created, {refreshed} refreshed, {skipped} skipped.",
         created=created,
         refreshed=refreshed,
         skipped=skipped,
         total=int(social_summary.get("total") or created + refreshed + skipped),
         run_id=str(trigger_info.get("run_id") or run_id),
         trigger=str(trigger_info.get("trigger") or "manual"),
-        owner="x-engage",
-        service="x-engage",
+        owner="socialos",
+        service="socialos-runtime",
         mode=REQUIRED_MODE,
         allow_live_actions=False,
         queue_summary=queue_summary,
@@ -140,7 +140,7 @@ class _RefillHandler(BaseHTTPRequestHandler):
         if self.path not in {"/health", "/queue-refill/health"}:
             self._send(404, _json_response(False, "not_found", "Use POST /queue-refill."))
             return
-        self._send(200, _json_response(True, "ok", "x-engage queue refill endpoint is healthy.", service="x-engage"))
+        self._send(200, _json_response(True, "ok", "x-engage queue refill endpoint is healthy.", service="socialos-runtime"))
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         if self.path not in {"/queue-refill", "/refill"}:
@@ -173,7 +173,7 @@ def serve(host: str, port: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="x-engage Social OS review queue refill contract")
+    parser = argparse.ArgumentParser(description="Socialos runtime review queue refill contract")
     parser.add_argument("--serve", action="store_true", help="Run a tiny HTTP server exposing POST /queue-refill")
     parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host for --serve")
     parser.add_argument("--port", type=int, default=8788, help="HTTP bind port for --serve")

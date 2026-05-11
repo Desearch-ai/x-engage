@@ -25,6 +25,7 @@ import requests
 from dotenv import load_dotenv
 
 from runtime_loader import emit_social_runtime_event, load_config as load_runtime_config, write_social_os_review_rows
+from source_connectors import load_source_signals
 
 # ─────────────────────────────────────────────
 # Config & Env
@@ -147,6 +148,13 @@ DEFAULT_ACCOUNT_FILTERS: dict[str, dict[str, Any]] = {
         "min_confidence": 0.58,
         "writing_standard": "Authentic founder voice; first-person/story-driven; conversational; avoid corporate/product-announcement copy.",
     },
+    "mokradze": {
+        "positive": ["openclaw", "agent workflow", "agents", "operator", "ops", "bittensor", "desearch", "mission control"],
+        "secondary": ["runtime", "automation", "qa", "debugging", "developer tooling"],
+        "negative": ["buy now", "price prediction", "pump", "scam", "giveaway"],
+        "min_confidence": 0.58,
+        "writing_standard": "Operator/developer voice for @MOkradze; practical, technical, concise, and explicit about reliability or workflow value.",
+    },
 }
 
 ACCOUNT_FILTER_ALIASES: dict[str, str] = {
@@ -159,6 +167,9 @@ ACCOUNT_FILTER_ALIASES: dict[str, str] = {
     "comic_desearch": "cosmicquantum",
     "@cosmicquantum": "cosmicquantum",
     "@cosmic_desearch": "cosmicquantum",
+    "mokradze": "mokradze",
+    "@mokradze": "mokradze",
+    "operator": "mokradze",
 }
 
 
@@ -193,24 +204,49 @@ def _canonical_account_key(account: dict[str, Any]) -> str:
     return (_account_keys(account) or [str(account.get("id", "unknown"))])[0]
 
 
+def _account_embedded_filter(account: dict[str, Any]) -> dict[str, Any]:
+    for key in ("filters", "account_filters", "account_strategy_filter", "strategy_filter"):
+        value = account.get(key)
+        if isinstance(value, dict):
+            return value
+    profile = account.get("profile") if isinstance(account.get("profile"), dict) else {}
+    for key in ("filters", "account_filters", "account_strategy_filter", "strategy_filter"):
+        value = profile.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _configured_filter_lookup(config: dict[str, Any], candidates: list[str]) -> dict[str, Any]:
+    normalized_config = {str(k).lstrip("@").strip().lower(): v for k, v in config.items() if isinstance(v, dict)}
+    for key in candidates:
+        normalized = key.lstrip("@").strip().lower()
+        raw = normalized_config.get(normalized)
+        if isinstance(raw, dict):
+            return raw
+    return {}
+
+
 def _configured_filter_for_account(account: dict[str, Any], account_filters: dict[str, Any] | None) -> dict[str, Any]:
     config = account_filters if isinstance(account_filters, dict) else {}
     keys = _account_keys(account)
     canonical = _canonical_account_key(account)
     candidates = [*keys, canonical]
-    selected: dict[str, Any] = {}
-    for key in candidates:
-        raw = config.get(key) or config.get(f"@{key}")
-        if isinstance(raw, dict):
-            selected = raw
-            break
+    selected = _account_embedded_filter(account) or _configured_filter_lookup(config, candidates)
     defaults = DEFAULT_ACCOUNT_FILTERS.get(canonical, {})
+    style = account.get("style") or (account.get("profile") if isinstance(account.get("profile"), dict) else {}).get("style")
+    tone_rules = account.get("tone_rules") or (account.get("profile") if isinstance(account.get("profile"), dict) else {}).get("tone_rules")
+    writing_standard = str(selected.get("writing_standard") or defaults.get("writing_standard") or "Account-specific writing standard must be satisfied before review.")
+    if style and "writing_standard" not in selected:
+        writing_standard = f"{writing_standard} Style: {style}."
+    if isinstance(tone_rules, dict) and tone_rules and "writing_standard" not in selected:
+        writing_standard = f"{writing_standard} Tone rules: {json.dumps(tone_rules, sort_keys=True, ensure_ascii=False)}."
     return {
         "positive": _clean_terms(selected.get("positive") or selected.get("primary") or selected.get("primary_keywords")) or defaults.get("positive", []),
         "secondary": _clean_terms(selected.get("secondary") or selected.get("secondary_keywords")) or defaults.get("secondary", []),
         "negative": _clean_terms(selected.get("negative") or selected.get("negative_filters")) or defaults.get("negative", []),
-        "min_confidence": float(selected.get("min_confidence") or defaults.get("min_confidence") or 0.55),
-        "writing_standard": str(selected.get("writing_standard") or defaults.get("writing_standard") or "Account-specific writing standard must be satisfied before review."),
+        "min_confidence": float(selected.get("min_confidence") or account.get("min_confidence") or defaults.get("min_confidence") or 0.55),
+        "writing_standard": writing_standard,
     }
 
 
@@ -1181,8 +1217,8 @@ def _trigger_context(
         "run_id": run_identifier,
         "trigger": trigger_type,
         "dry_run": dry_run,
-        "service": "x-engage",
-        "owner": "x-engage",
+        "service": "socialos-runtime",
+        "owner": "socialos",
         "mode": "review_queue_only" if review_queue_only else "analyze_and_report",
         "allow_live_actions": False,
         "runtime_source": cfg.get("runtime_source", "config_fallback"),
@@ -1222,15 +1258,18 @@ def run(
         labels = ", ".join(a.get("label", a["id"]) for a in accounts)
         print(f"[analyze] Accounts ({cfg.get('runtime_source', 'config_fallback')}): {labels}", file=sys.stderr)
 
-    # Load tweets window
-    window_path = Path(cfg["x_monitor_window_path"])
-    if not window_path.exists():
-        print(f"[warn] tweets_window.json not found at {window_path}, using empty list", file=sys.stderr)
-        tweets: list[dict] = []
-    else:
-        tweets = json.loads(window_path.read_text())
+    # Load bounded Socialos source connectors. The default connector remains the
+    # legacy x-monitor window path, but normalized Signal records and future
+    # connector types share the same analyzer shape from here down.
+    window_path = Path(cfg.get("x_monitor_window_path", "")) if cfg.get("x_monitor_window_path") else Path("")
+    tweets, source_report = load_source_signals(cfg)
+    if not tweets and not source_report.get("connectors") and cfg.get("x_monitor_window_path"):
+        print(f"[warn] no source connector loaded for {window_path}", file=sys.stderr)
+    for connector in source_report.get("connectors", []):
+        if connector.get("status") in {"error", "partial"}:
+            print(f"[source] {connector.get('type')} {connector.get('status')}: {connector.get('error') or connector.get('errors')}", file=sys.stderr)
 
-    print(f"[analyze] Loaded {len(tweets)} tweets from window", file=sys.stderr)
+    print(f"[analyze] Loaded {len(tweets)} source signal(s)", file=sys.stderr)
 
     weights = cfg.get("score_weights", {
         "likes": 3, "retweets": 5, "replies": 2,
@@ -1268,6 +1307,7 @@ def run(
     analysis_input_metadata = {
         **trigger_info,
         "x_monitor_window_path": str(window_path),
+        "source_report": source_report,
         "signal_counts": {
             "loaded": len(tweets),
             "selected": len(top_10),
@@ -1289,7 +1329,7 @@ def run(
     }
     emit_social_runtime_event(
         "info",
-        f"Analyzer selected {len(top_10)} of {len(tweets)} x-monitor signals",
+        f"Socialos runtime selected {len(top_10)} of {len(tweets)} source signal(s)",
         analysis_input_metadata,
     )
 
@@ -1358,6 +1398,7 @@ def run(
         "filter_summary": filter_summary,
         "filter_decisions": filter_decisions,
         "skipped_filter_decisions": skipped_filter_decisions,
+        "source_report": source_report,
     }
 
     if dry_run:
@@ -1414,6 +1455,7 @@ def run(
             {
                 **trigger_info,
                 "x_monitor_window_path": str(window_path),
+                "source_report": source_report,
                 "signal_counts": analysis_input_metadata["signal_counts"],
                 "selected_signals": selected_signals,
                 "filter_summary": filter_summary,

@@ -22,7 +22,10 @@
       "lane": "founder",
       "browser_profile": "~/.x-engage-browser/personal",
       "min_confidence": 0.7,
-      "action_types": ["retweet", "quote"]
+      "action_types": [
+        "retweet",
+        "quote"
+      ]
     },
     {
       "id": "brand",
@@ -31,7 +34,64 @@
       "lane": "brand",
       "browser_profile": "~/.x-engage-browser/brand",
       "min_confidence": 0.8,
-      "action_types": ["quote"]
+      "action_types": [
+        "quote"
+      ]
+    },
+    {
+      "id": "mokradze",
+      "label": "@MOkradze (operator)",
+      "handle": "MOkradze",
+      "lane": "operator",
+      "browser_profile": "~/.x-engage-browser/mokradze",
+      "min_confidence": 0.7,
+      "style": "operator/developer",
+      "tone_rules": {
+        "voice": "precise, practical, reliability-focused"
+      },
+      "execution_status": "disabled_until_session_configured",
+      "blockers": [
+        "missing_auth_until_socialos_session_mapping_configured"
+      ],
+      "action_types": [
+        "quote"
+      ]
     }
-  ]
+  ],
+  "source_connectors": [
+    {
+      "type": "x_monitor_signal",
+      "path": "/Users/giga/projects/openclaw/x-monitor/tweets_window.json"
+    }
+  ],
+  "account_filters": {
+    "MOkradze": {
+      "positive": [
+        "openclaw",
+        "agent workflow",
+        "agents",
+        "operator",
+        "ops",
+        "bittensor",
+        "desearch",
+        "mission control"
+      ],
+      "secondary": [
+        "runtime",
+        "automation",
+        "qa",
+        "debugging",
+        "developer tooling"
+      ],
+      "negative": [
+        "buy now",
+        "price prediction",
+        "pump",
+        "scam",
+        "giveaway"
+      ],
+      "min_confidence": 0.58,
+      "writing_standard": "Operator/developer voice for @MOkradze; practical, technical, concise, and explicit about reliability or workflow value."
+    }
+  }
 }

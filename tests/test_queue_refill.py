@@ -201,7 +201,7 @@ def test_analyze_review_queue_only_uses_generation_path_and_skips_discord(tmp_pa
 
     assert result["trigger"]["run_id"] == "run-943"
     assert result["trigger"]["trigger"] == "manual"
-    assert result["trigger"]["owner"] == "x-engage"
+    assert result["trigger"]["owner"] == "socialos"
     assert result["trigger"]["mode"] == "review_queue_only"
     assert result["trigger"]["allow_live_actions"] is False
     assert result["trigger"]["next_run_at"] == "2026-05-04T08:49:00+00:00"
@@ -214,8 +214,8 @@ def test_analyze_review_queue_only_uses_generation_path_and_skips_discord(tmp_pa
     completion_events = [e for e in events if "Review queue refill completed" in e["message"]]
     assert completion_events
     metadata = completion_events[-1]["metadata"]
-    assert metadata["service"] == "x-engage"
-    assert metadata["owner"] == "x-engage"
+    assert metadata["service"] == "socialos-runtime"
+    assert metadata["owner"] == "socialos"
     assert metadata["trigger"] == "manual"
     assert metadata["x_monitor_window_path"] == str(window_path)
     assert metadata["signal_counts"]["loaded"] == 1
@@ -223,3 +223,48 @@ def test_analyze_review_queue_only_uses_generation_path_and_skips_discord(tmp_pa
     assert metadata["queue_summary"]["created"] == 1
     assert metadata["social_os_summary"]["created"] == 1
     assert metadata["request"]["source"] == "social-os-ui"
+
+def test_analyze_review_queue_only_consumes_normalized_x_monitor_signal(tmp_path, monkeypatch):
+    window_path = tmp_path / "signals.json"
+    window_path.write_text(json.dumps([
+        {
+            "signal_id": "sig-normalized-1",
+            "type": "keyword",
+            "source": "x-monitor",
+            "content": {
+                "text": "Desearch SN22 API signal for builders",
+                "author": "@builder",
+                "url": "https://x.com/builder/status/1616",
+            },
+            "context": {"matched_term": "SN22", "watchlist_name": "bittensor"},
+            "route_hints": {"lanes": ["brand"], "channel": "#x-monitor", "priority": 1},
+            "metrics": {"like_count": 20, "view_count": 2000},
+        }
+    ]))
+    pending_path = tmp_path / "pending_actions.json"
+    cfg = {
+        "x_monitor_window_path": str(window_path),
+        "pending_actions_path": str(pending_path),
+        "discord_channel_id": "unused",
+        "top_n": 10,
+        "top_deep_dive": 3,
+        "engage_check_interval_seconds": 3600,
+        "runtime_source": "managed_file",
+        "score_weights": {"likes": 3, "retweets": 5, "replies": 2, "views": 0.01, "quotes": 4, "bookmarks": 2},
+        "x_accounts": [
+            {"id": "brand", "handle": "desearch_ai", "label": "@desearch_ai", "lane": "brand", "action_types": ["quote"]},
+        ],
+    }
+    social_writes = []
+
+    monkeypatch.setattr(analyze, "load_runtime_config", lambda: cfg)
+    monkeypatch.setattr(analyze, "emit_social_runtime_event", lambda *args, **kwargs: True)
+    monkeypatch.setattr(analyze, "write_social_os_review_rows", lambda items: social_writes.append(items) or {"created": len(items), "refreshed": 0, "skipped": 0, "total": len(items)})
+
+    result = analyze.run(dry_run=False, skip_llm=True, trigger="manual", run_id="normalized-run", review_queue_only=True)
+
+    assert result["signal_counts"]["loaded"] == 1
+    assert result["source_report"]["connectors"][0]["type"] == "x_monitor_signal"
+    assert result["filter_summary"]["selected"] == 1
+    assert social_writes[0][0]["source_signal_id"] == "sig-normalized-1"
+    assert social_writes[0][0]["monitored_source"]["source"] == "x-monitor"
