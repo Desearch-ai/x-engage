@@ -492,7 +492,7 @@ async def run_executor(dry_run: bool = False) -> int:
             print("[executor] No approved actions found in pending_actions.json.")
             emit_social_runtime_event(
                 "info",
-                "Executor found no approved x-engage actions",
+                "Executor found no approved Socialos runtime actions",
                 {"dry_run": dry_run, "approved_count": 0},
             )
             return 0

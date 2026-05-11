@@ -41,7 +41,7 @@ def test_emit_social_runtime_event_posts_to_social_runtime_events(monkeypatch):
 
     assert emit_social_runtime_event("info", "Queue refreshed", {"run_id": "run-1"}) is True
     assert calls[0]["url"].endswith("/rest/v1/social_runtime_events")
-    assert calls[0]["json"][0]["service"] == "x-engage"
+    assert calls[0]["json"][0]["service"] == "socialos-runtime"
     assert calls[0]["json"][0]["event_type"] == "info"
     assert calls[0]["json"][0]["metadata"] == {"run_id": "run-1"}
 
@@ -367,3 +367,48 @@ def test_load_social_os_approved_rows_returns_empty_on_error(monkeypatch):
 
     result = load_social_os_approved_rows()
     assert result == []
+
+
+def test_normalize_projection_preserves_socialos_account_profiles():
+    from runtime_loader import normalize_x_engage_projection
+
+    projection = normalize_x_engage_projection({
+        "lane_routing": {"operator": ["@MOkradze"]},
+        "session_mappings": {"@MOkradze": "operator-session"},
+        "account_profiles": {
+            "@MOkradze": {
+                "style": "operator/developer",
+                "tone_rules": {"voice": "precise"},
+                "filters": {"positive": ["OpenClaw"], "min_confidence": 0.5},
+            }
+        },
+    })
+
+    assert projection["account_profiles"]["MOkradze"]["style"] == "operator/developer"
+    assert projection["account_profiles"]["MOkradze"]["tone_rules"] == {"voice": "precise"}
+
+
+def test_managed_accounts_attach_socialos_account_profile(tmp_path, monkeypatch):
+    from runtime_loader import build_managed_accounts
+
+    projection = {
+        "lane_routing": {"operator": ["MOkradze"]},
+        "session_mappings": {"MOkradze": "operator-session"},
+        "account_profiles": {
+            "MOkradze": {
+                "style": "operator/developer",
+                "tone_rules": {"voice": "precise"},
+                "filters": {"positive": ["OpenClaw"], "min_confidence": 0.5},
+            }
+        },
+    }
+    monkeypatch.setenv("X_ENGAGE_BROWSER_PROFILE_ROOT", str(tmp_path / "profiles"))
+
+    accounts = build_managed_accounts(projection, [])
+
+    assert accounts[0]["id"] == "MOkradze"
+    assert accounts[0]["handle"] == "MOkradze"
+    assert accounts[0]["style"] == "operator/developer"
+    assert accounts[0]["tone_rules"] == {"voice": "precise"}
+    assert accounts[0]["filters"]["positive"] == ["OpenClaw"]
+    assert accounts[0]["browser_profile"].endswith("operator-session")

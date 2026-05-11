@@ -302,6 +302,45 @@ class TestQualificationAndRouting:
         assert "x-monitor-route:founder" in decision["matched_keywords"]
         assert "x-monitor supplied policy route hint" in decision["account_fit_reason"]
 
+
+    def test_mokradze_default_filter_and_style_are_first_class(self):
+        accounts = [
+            {"id": "mokradze", "handle": "MOkradze", "label": "@MOkradze", "lane": "operator", "action_types": ["quote"]},
+        ]
+        signal = {**TWEET_A, "id": "operator-fit", "text": "OpenClaw agent workflow and Bittensor ops notes", "_score": 1200.0}
+
+        decisions = qualify_and_route_signals([signal], accounts)
+
+        assert decisions[0]["selected"] is True
+        assert decisions[0]["selected_account"] == "MOkradze"
+        assert decisions[0]["selected_lane"] == "operator"
+        assert decisions[0]["writing_standard_check"]["summary"]
+
+    def test_socialos_account_profile_filter_overrides_defaults_for_future_accounts(self):
+        accounts = [{
+            "id": "future",
+            "handle": "future_handle",
+            "label": "@future_handle",
+            "lane": "community",
+            "action_types": ["quote"],
+            "style": "community educator",
+            "tone_rules": {"voice": "helpful"},
+            "filters": {
+                "positive": ["community alpha"],
+                "secondary": ["operators"],
+                "negative": ["giveaway"],
+                "min_confidence": 0.5,
+                "writing_standard": "Helpful community educator voice.",
+            },
+        }]
+        signal = {**TWEET_A, "id": "future-fit", "text": "community alpha for operators", "_score": 300.0}
+
+        decisions = qualify_and_route_signals([signal], accounts)
+
+        assert decisions[0]["selected"] is True
+        assert decisions[0]["selected_account"] == "future_handle"
+        assert decisions[0]["writing_standard_check"]["summary"] == "Helpful community educator voice."
+
     def test_negative_filters_still_override_x_monitor_route_hints(self):
         risky_routed_signal = {
             **TWEET_A,

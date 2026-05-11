@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).parent
 DEFAULT_CONFIG_PATH = SCRIPT_DIR / "config.json"
 DEFAULT_BROWSER_PROFILE_ROOT = Path.home() / ".x-engage-browser"
 
-SOCIAL_RUNTIME_SERVICE = "x-engage"
+SOCIAL_RUNTIME_SERVICE = "socialos-runtime"
 
 
 def _redact_path(path_value: str | None) -> str | None:
@@ -670,6 +670,35 @@ def _ensure_string_array_record(value: Any) -> dict[str, list[str]]:
     }
 
 
+
+
+def _ensure_account_profiles(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    profiles: dict[str, dict[str, Any]] = {}
+    for raw_handle, raw_profile in value.items():
+        handle = str(raw_handle or "").lstrip("@").strip()
+        if not handle or not isinstance(raw_profile, dict):
+            continue
+        profile: dict[str, Any] = {}
+        for key in ("style", "purpose", "execution_status"):
+            if isinstance(raw_profile.get(key), str) and raw_profile[key].strip():
+                profile[key] = raw_profile[key].strip()
+        if isinstance(raw_profile.get("tone_rules"), dict):
+            profile["tone_rules"] = copy.deepcopy(raw_profile["tone_rules"])
+        for filter_key in ("filters", "account_filters", "account_strategy_filter", "strategy_filter"):
+            if isinstance(raw_profile.get(filter_key), dict):
+                profile["filters"] = copy.deepcopy(raw_profile[filter_key])
+                break
+        enabled_sources = raw_profile.get("enabled_sources")
+        if isinstance(enabled_sources, list):
+            profile["enabled_sources"] = [str(item).strip() for item in enabled_sources if str(item).strip()]
+        blockers = raw_profile.get("blockers")
+        if isinstance(blockers, list):
+            profile["blockers"] = [str(item).strip() for item in blockers if str(item).strip()]
+        profiles[handle] = profile
+    return profiles
+
 def _browser_profile_root() -> Path:
     raw = os.environ.get("X_ENGAGE_BROWSER_PROFILE_ROOT", str(DEFAULT_BROWSER_PROFILE_ROOT))
     return Path(raw).expanduser().resolve()
@@ -731,6 +760,7 @@ def normalize_x_engage_projection(payload: dict[str, Any]) -> dict[str, Any]:
             "max_replies_per_day": _ensure_positive_int(rate_limits.get("max_replies_per_day") or payload.get("max_replies_per_day"), 20),
         },
         "check_interval_seconds": _ensure_positive_int(payload.get("check_interval_seconds") or payload.get("engage_check_interval_seconds"), 3600),
+        "account_profiles": _ensure_account_profiles(payload.get("account_profiles") or payload.get("accounts") or payload.get("profiles")),
     }
 
 
@@ -834,9 +864,11 @@ def build_managed_accounts(
                 continue
             seen.add(handle)
             local = _find_local_account(local_accounts, handle, lane) or {}
+            profile = copy.deepcopy((projection.get("account_profiles") or {}).get(handle, {}))
             account_id = local.get("id") or handle
-            action_types = local.get("action_types") or ["retweet", "quote"]
+            action_types = local.get("action_types") or profile.get("action_types") or ["retweet", "quote"]
             account = copy.deepcopy(local)
+            account.update(profile)
             account.update({
                 "id": account_id,
                 "handle": handle,
